@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v2.1 — T日买入评估 + T+1持有评估
+史诗级行情扫描器 v2.2 — T日买入评估 + T+1持有评估
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -298,30 +298,39 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     else:
         margin_long_chg = 0.0
 
-    # 启动前5日涨幅
+    # 启动前5日涨幅（启动日之前最近5个交易日）
     pre5 = price_df[price_df['trade_date'] < launch_date].tail(5)
     pre5_chg = 0.0
     if len(pre5) >= 3:
         pre5_chg = (pre5['close'].iloc[-1] / pre5['close'].iloc[0] - 1) * 100
 
+    # 启动前5日最大单日涨幅（用于Baux排除有明显异动的股票）
+    pre5_max_day = 0.0
+    if len(pre5) >= 2:
+        pre5['daily_return'] = pre5['close'].pct_change() * 100
+        pre5_max_day = pre5['daily_return'].max()
+
     quadrant = None
     quadrant_desc = None
-    if has_divergence and pre5_chg > 5:
+    # 启动前有明显异动（有任一单日涨幅>=5%）：A/B/Baux直接否决，都归D
+    has_pre_suspicious = pre5_max_day >= 5
+
+    if has_divergence and pre5_chg > 5 and not has_pre_suspicious:
         quadrant = 'A'
         quadrant_desc = '★ 最优先买入'
     elif pre5_chg < -5 and launch_margin_chg is not None and launch_margin_chg > 10:
         quadrant = 'B'
         quadrant_desc = '△ 谨慎买入（启动日融资>10%）'
-    elif margin_long_chg > 25 and pre5_chg < 10 and launch_margin_chg is not None and launch_margin_chg > 5:
-        # Baux：隐形建仓型 — 启动前融资持续增长+25%以上，但股价不涨；启动日融资温和增加
+    elif margin_long_chg > 25 and pre5_chg < 10 and pre5_max_day < 5 and launch_margin_chg is not None and launch_margin_chg > 3:
+        # Baux：隐形建仓型 — 启动前融资持续增长+25%以上，股价几乎不涨（总涨幅<10%且无单日异动），启动日融资温和增加>3%
         quadrant = 'Baux'
         quadrant_desc = '☆ 隐形建仓（融资持续增）'
-    elif pre5_chg > 5 and not has_divergence:
+    elif pre5_chg > 5 and pre5_chg < 10 and not has_divergence and not has_pre_suspicious:
         quadrant = 'C'
         quadrant_desc = '◇ 小仓位短线'
     else:
         quadrant = 'D'
-        quadrant_desc = '○ 坚决不买'
+        quadrant_desc = '○ 坚决不买（启动前有明显异动或无信号）'
 
     # ── T日买入总分 ──
     # 背离(0/1) + 量比(0/1) + 启动日融资(0/1/2)
@@ -392,6 +401,7 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         'quadrant': quadrant,
         'quadrant_desc': quadrant_desc,
         'pre5_chg': pre5_chg,
+        'pre5_max_day': pre5_max_day,
         'margin_long_chg': margin_long_chg,
         'margin_signal': margin_signal,
         'launch_margin_chg': launch_margin_chg,
@@ -569,7 +579,7 @@ def scan_date(target_date=None):
             elif r['quadrant'] == 'B':
                 print(f"     → 象限B，谨慎买入")
             elif r['quadrant'] == 'Baux':
-                print(f"     → 象限Baux，隐形建仓买入（融资持续增{int(r['margin_long_chg']):+.0f}%）")
+                print(f"     → 象限Baux，隐形建仓买入（融资持续增{int(r['margin_long_chg']):+.0f}%，前5日最大单日{int(r['pre5_max_day']):+.1f}%）")
             elif r['quadrant'] == 'C':
                 print(f"     → 象限C，小仓位短线")
             else:
@@ -590,11 +600,11 @@ def scan_date(target_date=None):
     print(f"  ② 缩量加速：持有期股价涨但量比持续下降")
     print(f"  ③ 连续涨停：启动日+次日均有涨停")
     print(f"\n象限分类（用于描述性分类，不直接加到总分）:")
-    print(f"  ★ 象限A：启动前涨幅>5% + 有实质背离 → 最优先买入")
+    print(f"  ★ 象限A：启动前涨幅>5% + 有实质背离 + 无单日异动>=5% → 最优先买入")
     print(f"  △ 象限B：启动前涨幅<-5% + 启动日融资>10% → 谨慎买入")
-    print(f"  ☆ 象限Baux：启动前融资持续增长+25%但股价不涨 + 启动日融资温和增加 → 隐形建仓买入")
-    print(f"  ◇ 象限C：启动前涨幅>5% + 无实质背离 → 小仓位短线")
-    print(f"  ○ 象限D：不属于A/B/Baux/C → 坚决不买")
+    print(f"  ☆ 象限Baux：启动前融资持续增长+25%但股价不涨（总涨幅<10%且无单日异动>=5%）+ 启动日融资>3% → 隐形建仓买入")
+    print(f"  ◇ 象限C：启动前涨幅5~10% + 无实质背离 + 无单日异动 → 小仓位短线")
+    print(f"  ○ 象限D：不属于A/B/Baux/C → 坚决不买（含启动前有明显异动）")
     print(f"{'='*70}")
 
 
