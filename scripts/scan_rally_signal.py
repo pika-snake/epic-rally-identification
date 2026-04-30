@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v1.7 — 基于第二步"验证有行情"
-每天扫描涨幅>=7%的股票，检查是否符合"有行情"信号
+史诗级行情扫描器 v2.1 — T日买入评估 + T+1持有评估
 
-v1.6升级：启动日还原打分（针对4板以上股票）
-- 问题：4板以上股票在山顶视角评分只有1-2分，但启动日角度可能得3-4分
-- 解决：对4板以上股票，增加"启动日还原打分"（从真实启动日重新跑第二步信号）
-- 触发条件：board_count >= 4
-- 用途：识别"本来就不是黑马" vs "被山顶视角低估的黑马"
+核心设计原则：
+- T日买入决策：只使用 T-1及之前 + T日当天 数据
+- T+1持有评估：使用 T+1及之后 数据（买入后用来判断要不要持有）
 
-信号逻辑（第二步核心）：
-1. 启动前背离：股价跌 / 融资余额增（持续至少5天）
-2. 启动后持续：融资余额连续增加
-3. 缩量加速：股价涨但量比下降
-4. 连续涨停：2天+
+T日买入评估（0~4分）：
+  ① 背离验证（1分）：启动前股价跌/融资余额增，持续>=5天
+     v2.1修复：改用"启动前最后10日窗口"，避免中间大幅波动切断背离判断
+  ② 量比验证（1分）：T日量比 < 前5日均量（缩量上涨）
+  ③ 象限分类（Baux新增）：启动前融资持续增长但股价不涨，隐形建仓型
+  ④ 启动日融资变化（最强单信号）：
+     - 启动日融资余额较前一交易日 >+10% → 强烈买入信号
+     - 启动日融资余额较前一交易日 <-5% → 否决信号
+     - 中间值 → 普通信号
+
+T+1持有评估（买入后使用，不用于买入决策）：
+  ① 融资持续：买入后连续3天融资余额增加
+  ② 缩量加速：持有期股价涨但量比持续下降
+  ③ 连续涨停：T日+T+1均有涨停
 
 性能优化：融资数据按日期批量查（每日1次API，不是每股票1次）
 
@@ -43,7 +49,6 @@ MIN_RISE_PCT = 7.0      # 涨幅门槛（%）
 MARGIN_DIVERGENCE_DAYS = 5  # 背离需要持续多少天
 CONTINUOUS_MARGIN_DAYS = 3  # 启动后融资余额需连续增加天数
 LOOKUP_DAYS = 5         # 向后多查多少个交易日找启动日（默认5个）
-BOARD_THRESHOLD = 4     # 触发启动日还原打分的板数门槛
 # =========================
 
 pro = ts.pro_api(TOKEN)
@@ -87,7 +92,7 @@ def load_all_margin_data(trade_dates):
 def get_price_data(ts_code, trade_dates):
     """获取个股日线数据（trade_dates为降序列表，最新在前）"""
     start = trade_dates[-1]  # 最老的日期
-    end = trade_dates[0]     # 最新的日期
+    end = trade_dates[0]     # 最新日期
     df = pro.daily(ts_code=ts_code, start_date=start, end_date=end,
                    fields='trade_date,close,pct_chg,vol,amount,open,high,low,pre_close')
     if df.empty:
@@ -98,30 +103,24 @@ def get_price_data(ts_code, trade_dates):
     return df
 
 
-def find_true_launch_date(ts_code, scan_date, all_trade_dates):
+def find_true_launch_date(ts_code, scan_date, all_calendar):
     """
-    v1.5新增：找到真正的启动日（连续涨停序列的第一板）
+    找到真正的启动日（连续涨停序列的第一板）
 
-    问题：4/21扫到600961时，它已是连续第4个涨停，真正的启动日是4/16
     规则：
         1. 从scan_date向前，逐个检查是否是涨停板(>=9.5%)
         2. 如果是涨停板，继续向前找
-        3. 直到找到"前一天<=5% 且 当天>=7%"的日子 → 这就是启动日
+        3. 直到找到"前一天涨幅<=5% 且 当天涨幅>=7%"的日子 → 这就是启动日
         4. 如果当天>=7%但<9.5%，也找到了（可能是反弹启动，不是连续板）
 
     返回: (启动日字符串, 第几板int) 或 (None, None)
     """
-    # 获取scan_date之后几个交易日的日期（用于获取向后数据）
-    forward_dates = get_trade_dates_asc(scan_date, LOOKUP_DAYS)
-    # 历史交易日（降序）
-    hist_dates = get_trade_dates_desc(scan_date, TRADE_DAYS_BACK)
-    # 完整日历：历史 + 未来（用于找前一个交易日）
-    all_calendar = sorted(set(hist_dates + forward_dates))
+    # 完整日历：历史 + 未来
+    all_calendar_sorted = sorted(all_calendar)
 
-    # 批量获取价格数据
-    # FIX bug1: start=earliest, end=latest (之前写反了)
-    start = all_calendar[0]
-    end = all_calendar[-1]
+    # 获取价格数据
+    start = all_calendar_sorted[0]
+    end = all_calendar_sorted[-1]
     df = pro.daily(ts_code=ts_code, start_date=start, end_date=end,
                    fields='trade_date,close,pct_chg,pre_close')
     if df.empty:
@@ -130,7 +129,7 @@ def find_true_launch_date(ts_code, scan_date, all_trade_dates):
     df = df.sort_values('trade_date').reset_index(drop=True)
     price_dict = {row['trade_date']: row['pct_chg'] for _, row in df.iterrows()}
 
-    # 按日期降序排列（在price_dict中存在的）
+    # 按日期降序排列
     dates_in_price = sorted([d for d in price_dict.keys() if d <= scan_date], reverse=True)
 
     for curr_date in dates_in_price:
@@ -141,16 +140,13 @@ def find_true_launch_date(ts_code, scan_date, all_trade_dates):
 
         # 找前一个（更早的）交易日
         curr_idx = None
-        for i, d in enumerate(all_calendar):
+        for i, d in enumerate(all_calendar_sorted):
             if d == curr_date:
                 curr_idx = i
                 break
         if curr_idx is None or curr_idx == 0:
             continue
-        # FIX bug2: 用[i-1]找前一个（更早的）交易日，而不是[i+1]
-        prev_trade_day = all_calendar[curr_idx - 1]
-
-        # 找前一个交易日的涨幅
+        prev_trade_day = all_calendar_sorted[curr_idx - 1]
         prev_pct = price_dict.get(prev_trade_day, None)
 
         # 判断是否是启动日
@@ -173,223 +169,179 @@ def find_true_launch_date(ts_code, scan_date, all_trade_dates):
             continue
         else:
             # 当天涨幅在7%~9.5%之间，不是连续板，也没找到启动日
-            # 说明这是单独的大涨（非涨停），scan_date之前没有更早的启动日
             break
 
-    # 没找到明确的启动日（可能是数据不连续）
     return None, None
 
 
-def rescore_from_launch(ts_code, true_launch_date, all_trade_dates):
+def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df, price_df):
     """
-    v1.6新增：从真实启动日角度重新打分（用于4板以上股票）
-    区别于analyze_stock，本函数用完整的启动日前30天数据来计算背离，
-    以及启动日到扫到日的完整数据来计算其他信号。
+    v2.0: T日买入评估 + T+1持有评估
 
-    返回: (还原总分, 信号字典)
+    T日买入评估（0~4分）：
+      ① 背离验证（1分）
+      ② 量比验证（1分）
+      ③ 象限分类（T日开盘前决策，0/1分）
+      ④ 启动日融资变化（最强单信号，0~2分）
+
+    T+1持有评估（买入后使用）：
+      ① 融资持续
+      ② 缩量加速
+      ③ 连续涨停
     """
-    # 获取启动日之前30天的历史数据（用于背离检测）
-    hist_dates = get_trade_dates_desc(true_launch_date, TRADE_DAYS_BACK)
-    # 获取启动日之后的数据（用于融资持续+缩量+涨停）
-    # 最远查到all_trade_dates中最远的日期
-    forward_dates = sorted([d for d in all_trade_dates if d >= true_launch_date])
-    all_dates = sorted(set(hist_dates + forward_dates))
-
-    # 加载价格数据
-    price_df = pro.daily(ts_code=ts_code, start_date=all_dates[0], end_date=all_dates[-1],
-                         fields='trade_date,close,pct_chg,vol')
-    if price_df.empty:
-        return 0, {}
-    price_df = price_df.sort_values('trade_date').reset_index(drop=True)
-    price_df['vol_ma5'] = price_df['vol'].rolling(5).mean().shift(1)
-    price_df['vol_ratio'] = price_df['vol'] / price_df['vol_ma5']
-
-    # 加载融资数据（批量）
-    margin_records = []
-    for td in hist_dates:
-        try:
-            df_m = pro.margin_detail(trade_date=td)
-            if len(df_m) > 0:
-                sub = df_m[df_m['ts_code'] == ts_code]
-                if len(sub) > 0:
-                    margin_records.append({'trade_date': td, 'rzye_yi': sub['rzye'].iloc[0] / 1e8})
-            time.sleep(0.05)
-        except:
-            pass
-
-    margin_df = pd.DataFrame(margin_records)
-
-    # ── 信号1: 背离 ──
-    price_before = price_df[price_df['trade_date'] < true_launch_date].copy()
-    margin_before = margin_df[margin_df['trade_date'] < true_launch_date].copy() if not margin_df.empty else pd.DataFrame()
-
-    divergence_days = 0
-    price_chg = 0.0
-    margin_chg = 0.0
-    has_divergence = False
-
-    if len(price_before) >= 10 and len(margin_before) >= 5:
-        merged = price_before.merge(margin_before, on='trade_date', how='inner')
-        merged = merged.sort_values('trade_date').reset_index(drop=True)
-
-        if len(merged) >= 5:
-            for i in range(len(merged) - 1):
-                curr = merged.iloc[i]
-                nxt = merged.iloc[i + 1]
-                if nxt['close'] < curr['close'] and nxt['rzye_yi'] > curr['rzye_yi']:
-                    divergence_days += 1
-
-            mid = len(merged) // 2
-            if mid < 1: mid = 1
-            first_h = merged.iloc[:mid]
-            second_h = merged.iloc[mid:]
-
-            if len(first_h) >= 2 and len(second_h) >= 2:
-                price_chg = (second_h['close'].iloc[-1] / first_h['close'].iloc[0] - 1) * 100
-                margin_chg = (second_h['rzye_yi'].iloc[-1] / first_h['rzye_yi'].iloc[0] - 1) * 100
-                has_divergence = (price_chg < 0) and (margin_chg > 0) and (divergence_days >= MARGIN_DIVERGENCE_DAYS)
-
-    # ── 信号2: 启动后融资持续增加 ──
-    # 重新从all_trade_dates获取启动日后的融资数据
-    post_launch_margin = []
-    for td in [d for d in all_trade_dates if d >= true_launch_date]:
-        try:
-            df_m = pro.margin_detail(trade_date=td)
-            if len(df_m) > 0:
-                sub = df_m[df_m['ts_code'] == ts_code]
-                if len(sub) > 0:
-                    post_launch_margin.append({'trade_date': td, 'rzye_yi': sub['rzye'].iloc[0] / 1e8})
-            time.sleep(0.05)
-        except:
-            pass
-
-    post_margin_df = pd.DataFrame(post_launch_margin)
-    has_cont = False
-    cont_days = 0
-    margin_increase = 0.0
-
-    if len(post_margin_df) >= CONTINUOUS_MARGIN_DAYS:
-        post_margin_df = post_margin_df.sort_values('trade_date').reset_index(drop=True)
-        consecutive = 0
-        for i in range(1, len(post_margin_df)):
-            if post_margin_df.iloc[i]['rzye_yi'] > post_margin_df.iloc[i-1]['rzye_yi']:
-                consecutive += 1
-            else:
-                break
-        cont_days = consecutive
-        has_cont = consecutive >= CONTINUOUS_MARGIN_DAYS
-        if consecutive > 0:
-            margin_increase = (post_margin_df.iloc[consecutive]['rzye_yi'] /
-                             post_margin_df.iloc[0]['rzye_yi'] - 1) * 100
-
-    # ── 信号3: 缩量加速 ──
-    price_after = price_df[price_df['trade_date'] >= true_launch_date].copy()
-    has_shrink = False
-    vol_ratio_change = 1.0
-
-    if len(price_before) >= 3 and len(price_after) >= 2:
-        vr_before = price_before['vol_ratio'].tail(3).mean()
-        vr_after = price_after['vol_ratio'].head(3).mean()
-        avg_pct_after = price_after['pct_chg'].head(3).mean()
-        has_shrink = (avg_pct_after > 0) and (vr_after < vr_before)
-        vol_ratio_change = vr_after / vr_before if vr_before > 0 else 1.0
-
-    # ── 信号4: 连续涨停 ──
-    launch_plus1 = price_after[price_after['trade_date'] > true_launch_date].head(5)
-    recent = pd.concat([price_df[price_df['trade_date'] == true_launch_date], launch_plus1]).tail(6)
-    limit_days = (recent['pct_chg'] >= 9.5).sum()
-    has_limit = limit_days >= 2
-
-    score = sum([has_divergence, has_cont, has_shrink, has_limit])
-
-    return score, {
-        'ts_code': ts_code,
-        'launch_date': true_launch_date,
-        'score': score,
-        'divergence': has_divergence,
-        'div_days': divergence_days,
-        'price_chg': price_chg,
-        'margin_chg': margin_chg,
-        'margin_cont': has_cont,
-        'cont_days': cont_days,
-        'margin_increase': margin_increase,
-        'shrink': has_shrink,
-        'vol_ratio_change': vol_ratio_change,
-        'limit_up': has_limit,
-        'limit_days': limit_days,
-    }
-
-
-def analyze_stock(ts_code, name, pct_chg, scan_date, all_trade_dates, margin_df, price_df):
-    """
-    分析单只股票的第二步信号
-    scan_date: 扫描日期（字符串，如'20260327'）
-    all_trade_dates: 升序排列的完整日历（含历史+未来，用于find_true_launch_date）
-    返回: 信号字典或None
-    """
-    # ── v1.5新增：找到真正的启动日 ──
-    launch_date, board_count = find_true_launch_date(ts_code, scan_date, all_trade_dates)
-
+    # ── 找到真正的启动日 ──
+    launch_date, board_count = find_true_launch_date(ts_code, scan_date, all_calendar)
     if launch_date is None:
         return None
 
-    # 启动日涨幅
+    # ── 启动日涨幅 ──
     launch_pct = None
     for _, row in price_df.iterrows():
         if row['trade_date'] == launch_date:
             launch_pct = row['pct_chg']
             break
 
-    # ── 信号1: 启动前背离检测 ──
-    # 背离分析：用launch_date之前的数据
+    # ═══════════════════════════════════════════════════════════
+    # T日买入评估
+    # ═══════════════════════════════════════════════════════════
+
+    # ── ① 背离验证（使用启动日前数据）────────────
     price_before = price_df[price_df['trade_date'] < launch_date].copy()
     margin_before_ts = margin_df[margin_df['trade_date'] < launch_date].copy()
     margin_before_ts = margin_before_ts[margin_before_ts['ts_code'] == ts_code]
 
-    if len(price_before) < 10 or len(margin_before_ts) < 5:
-        has_divergence = False
-        divergence_days = 0
-        price_chg = 0.0
-        margin_chg = 0.0
-    else:
+    divergence_days = 0
+    price_chg = 0.0
+    margin_chg = 0.0
+    has_divergence = False
+
+    if len(price_before) >= 10 and len(margin_before_ts) >= 5:
         merged_before = price_before.merge(margin_before_ts[['trade_date', 'rzye_yi']], on='trade_date', how='inner')
-        if len(merged_before) < 5:
-            has_divergence = False
+        if len(merged_before) >= 5:
+            merged_before = merged_before.sort_values('trade_date').reset_index(drop=True)
+
+            # v2.1修复：改用"启动前最后10日窗口"判断背离
+            # 避免中间大幅波动（四连板/深跌）切断导致背离判断失真
+            DIV_WINDOW = 10
+            last_n = merged_before.tail(DIV_WINDOW)
+
+            # 逐日背离天数（最后10日窗口内）
             divergence_days = 0
-            price_chg = 0.0
-            margin_chg = 0.0
-        else:
-            # 逐日背离天数
-            divergence_days = 0
-            for i in range(len(merged_before) - 1):
-                curr = merged_before.iloc[i]
-                nxt = merged_before.iloc[i + 1]
+            for i in range(len(last_n) - 1):
+                curr = last_n.iloc[i]
+                nxt = last_n.iloc[i + 1]
                 if (nxt['close'] < curr['close']) and (nxt['rzye_yi'] > curr['rzye_yi']):
                     divergence_days += 1
 
-            mid = len(merged_before) // 2
-            if mid < 1: mid = 1
-            first_h = merged_before.iloc[:mid]
-            second_h = merged_before.iloc[mid:]
+            # 最后10日窗口内的股价/融资变化
+            if len(last_n) >= 3:
+                price_chg = (last_n['close'].iloc[-1] / last_n['close'].iloc[0] - 1) * 100
+                margin_chg = (last_n['rzye_yi'].iloc[-1] / last_n['rzye_yi'].iloc[0] - 1) * 100
+                has_divergence = (price_chg < 0) and (margin_chg > 0) and (divergence_days >= 3)
 
-            if len(first_h) >= 2 and len(second_h) >= 2:
-                price_chg = (second_h['close'].iloc[-1] / first_h['close'].iloc[0] - 1) * 100
-                margin_chg = (second_h['rzye_yi'].iloc[-1] / first_h['rzye_yi'].iloc[0] - 1) * 100
-                has_divergence = (price_chg < 0) and (margin_chg > 0) and (divergence_days >= MARGIN_DIVERGENCE_DAYS)
+    # ── ② 量比验证（使用T日当天数据）────────────
+    # T日量比 vs 前5日均量（判断是否缩量上涨）
+    vol_ratio_tday = None
+    vol_ma5_before = None
+    has_volume_shrink = False
+
+    scan_row = price_df[price_df['trade_date'] == scan_date]
+    if not scan_row.empty:
+        vol_ratio_tday = scan_row['vol_ratio'].iloc[0]
+        # 前5日均量（不含T日）
+        vol_ma5_before = price_df[
+            (price_df['trade_date'] < scan_date) &
+            (price_df['trade_date'] >= launch_date)
+        ]['vol_ratio'].mean() if len(price_df[price_df['trade_date'] < scan_date]) >= 5 else None
+
+        # T日上涨且量比低于前期均值 → 缩量上涨
+        if vol_ratio_tday is not None and vol_ma5_before is not None and vol_ma5_before > 0:
+            has_volume_shrink = (pct_chg > 0) and (vol_ratio_tday < vol_ma5_before * 0.9)  # 量比低于前期均值90%
+
+    # ── ④ 启动日融资变化（最强单信号，使用启动日当天数据）────────────
+    # 获取启动日融资余额 vs 前一交易日
+    launch_margin = margin_df[
+        (margin_df['ts_code'] == ts_code) &
+        (margin_df['trade_date'] == launch_date)
+    ]
+    prev_margin = margin_df[
+        (margin_df['ts_code'] == ts_code) &
+        (margin_df['trade_date'] < launch_date)
+    ].sort_values('trade_date', ascending=False).head(1)
+
+    launch_margin_chg = None  # 启动日融资变化%
+    margin_signal = 0         # 0/1/2
+    margin_signal_desc = '无数据'
+
+    if not launch_margin.empty and not prev_margin.empty:
+        launch_rzye = launch_margin['rzye_yi'].iloc[0]
+        prev_rzye = prev_margin['rzye_yi'].iloc[0]
+        if prev_rzye > 0:
+            launch_margin_chg = (launch_rzye / prev_rzye - 1) * 100
+
+            if launch_margin_chg > 10:
+                margin_signal = 2   # 强烈买入信号
+                margin_signal_desc = f'+{launch_margin_chg:.1f}% 强烈买入'
+            elif launch_margin_chg < -5:
+                margin_signal = 0   # 否决信号
+                margin_signal_desc = f'{launch_margin_chg:.1f}% 否决'
             else:
-                has_divergence = False
-                price_chg = 0.0
-                margin_chg = 0.0
+                margin_signal = 1   # 普通信号
+                margin_signal_desc = f'{launch_margin_chg:+.1f}% 普通'
 
-    # ── 信号2: 启动后融资余额持续增加 ──
-    # 用launch_date之后的数据（而不是scan_date）
-    price_after = price_df[price_df['trade_date'] >= launch_date].copy()
+    # ── ③ 象限分类（使用启动日前数据）────────────
+    # Baux新增：启动前融资持续增长但股价几乎不涨（隐形建仓型）
+    # 计算启动前30日融资变化（捕捉长期无声建仓）
+    margin_before_sorted = margin_before_ts.sort_values('trade_date')
+    if len(margin_before_sorted) >= 10:
+        margin_long_chg = (margin_before_sorted['rzye_yi'].iloc[-1] / margin_before_sorted['rzye_yi'].iloc[0] - 1) * 100
+    else:
+        margin_long_chg = 0.0
+
+    # 启动前5日涨幅
+    pre5 = price_df[price_df['trade_date'] < launch_date].tail(5)
+    pre5_chg = 0.0
+    if len(pre5) >= 3:
+        pre5_chg = (pre5['close'].iloc[-1] / pre5['close'].iloc[0] - 1) * 100
+
+    quadrant = None
+    quadrant_desc = None
+    if has_divergence and pre5_chg > 5:
+        quadrant = 'A'
+        quadrant_desc = '★ 最优先买入'
+    elif pre5_chg < -5 and launch_margin_chg is not None and launch_margin_chg > 10:
+        quadrant = 'B'
+        quadrant_desc = '△ 谨慎买入（启动日融资>10%）'
+    elif margin_long_chg > 25 and pre5_chg < 10 and launch_margin_chg is not None and launch_margin_chg > 5:
+        # Baux：隐形建仓型 — 启动前融资持续增长+25%以上，但股价不涨；启动日融资温和增加
+        quadrant = 'Baux'
+        quadrant_desc = '☆ 隐形建仓（融资持续增）'
+    elif pre5_chg > 5 and not has_divergence:
+        quadrant = 'C'
+        quadrant_desc = '◇ 小仓位短线'
+    else:
+        quadrant = 'D'
+        quadrant_desc = '○ 坚决不买'
+
+    # ── T日买入总分 ──
+    # 背离(0/1) + 量比(0/1) + 启动日融资(0/1/2)
+    # 象限用于描述性分类，不直接加到总分（决定是否值得买）
+    t_day_score = int(has_divergence) + int(has_volume_shrink) + margin_signal
+
+    # ═══════════════════════════════════════════════════════════
+    # T+1持有评估（使用启动日后数据，包括T+1）
+    # ═══════════════════════════════════════════════════════════
+    price_after_launch = price_df[price_df['trade_date'] >= launch_date].copy()
     margin_after_ts = margin_df[margin_df['trade_date'] >= launch_date].copy()
     margin_after_ts = margin_after_ts[margin_after_ts['ts_code'] == ts_code].reset_index(drop=True)
 
-    if len(margin_after_ts) < CONTINUOUS_MARGIN_DAYS:
-        has_cont, cont_days, margin_increase = False, 0, 0.0
-    else:
+    # ── ① 融资持续（启动日后连续增加）────────────
+    has_cont = False
+    cont_days = 0
+    margin_increase = 0.0
+
+    if len(margin_after_ts) >= CONTINUOUS_MARGIN_DAYS:
+        margin_after_ts = margin_after_ts.sort_values('trade_date').reset_index(drop=True)
         consecutive = 0
         for i in range(1, len(margin_after_ts)):
             if margin_after_ts.iloc[i]['rzye_yi'] > margin_after_ts.iloc[i-1]['rzye_yi']:
@@ -401,27 +353,23 @@ def analyze_stock(ts_code, name, pct_chg, scan_date, all_trade_dates, margin_df,
         if consecutive > 0:
             margin_increase = (margin_after_ts.iloc[consecutive]['rzye_yi'] /
                               margin_after_ts.iloc[0]['rzye_yi'] - 1) * 100
-        else:
-            margin_increase = 0.0
 
-    # ── 信号3: 缩量加速 ──
-    if len(price_before) >= 3 and len(price_after) >= 2:
+    # ── ② 缩量加速（启动日后量比持续下降）────────────
+    has_shrink = False
+    vol_ratio_change = 1.0
+
+    if len(price_before) >= 3 and len(price_after_launch) >= 2:
         vr_before = price_before['vol_ratio'].tail(3).mean()
-        vr_after = price_after['vol_ratio'].head(3).mean()
-        avg_pct_after = price_after['pct_chg'].head(3).mean()
+        vr_after = price_after_launch['vol_ratio'].head(3).mean()
+        avg_pct_after = price_after_launch['pct_chg'].head(3).mean()
         has_shrink = (avg_pct_after > 0) and (vr_after < vr_before)
         vol_ratio_change = vr_after / vr_before if vr_before > 0 else 1.0
-    else:
-        has_shrink, vol_ratio_change = False, 1.0
 
-    # ── 信号4: 连续涨停 ──
-    # 基于启动日后的数据判断
-    launch_plus1 = price_after[price_after['trade_date'] > launch_date].head(5)
+    # ── ③ 连续涨停（T日+T+1均有涨停）────────────
+    launch_plus1 = price_after_launch[price_after_launch['trade_date'] > launch_date].head(5)
     recent = pd.concat([price_df[price_df['trade_date'] == launch_date], launch_plus1]).tail(6)
     limit_days = (recent['pct_chg'] >= 9.5).sum()
     has_limit = limit_days >= 2
-
-    score = sum([has_divergence, has_cont, has_shrink, has_limit])
 
     return {
         'ts_code': ts_code,
@@ -431,17 +379,31 @@ def analyze_stock(ts_code, name, pct_chg, scan_date, all_trade_dates, margin_df,
         'launch_date': launch_date,
         'launch_pct': launch_pct,
         'board_count': board_count,
-        'score': score,
-        'divergence': has_divergence,
+
+        # T日买入评估
+        't_day_score': t_day_score,
+        'has_divergence': has_divergence,
         'div_days': divergence_days,
         'price_chg': price_chg,
         'margin_chg': margin_chg,
-        'margin_cont': has_cont,
+        'has_volume_shrink': has_volume_shrink,
+        'vol_ratio_tday': vol_ratio_tday,
+        'vol_ma5_before': vol_ma5_before,
+        'quadrant': quadrant,
+        'quadrant_desc': quadrant_desc,
+        'pre5_chg': pre5_chg,
+        'margin_long_chg': margin_long_chg,
+        'margin_signal': margin_signal,
+        'launch_margin_chg': launch_margin_chg,
+        'margin_signal_desc': margin_signal_desc,
+
+        # T+1持有评估
+        'has_cont': has_cont,
         'cont_days': cont_days,
         'margin_increase': margin_increase,
-        'shrink': has_shrink,
+        'has_shrink': has_shrink,
         'vol_ratio_change': vol_ratio_change,
-        'limit_up': has_limit,
+        'has_limit': has_limit,
         'limit_days': limit_days,
     }
 
@@ -455,9 +417,10 @@ def scan_date(target_date=None):
     else:
         target_date = str(target_date)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"📅 扫描日期: {target_date}  |  涨幅门槛: >={MIN_RISE_PCT}%")
-    print(f"{'='*60}\n")
+    print(f"🎯 评估类型: T日买入评估（启动日当天决策）")
+    print(f"{'='*70}\n")
 
     # Step 1: 涨幅>=7%的股票
     df_today = pro.daily(trade_date=target_date)
@@ -476,14 +439,11 @@ def scan_date(target_date=None):
 
     # Step 2: 历史交易日
     trade_dates_desc = get_trade_dates_desc(target_date, TRADE_DAYS_BACK)
-    # 完整日历（历史+未来），用于find_true_launch_date
     forward_dates = get_trade_dates_asc(target_date, LOOKUP_DAYS)
     all_calendar = sorted(set(trade_dates_desc + forward_dates))
-    trade_dates_asc = sorted(trade_dates_desc, reverse=False)  # 纯历史（用于兼容margin_df）
 
     print(f"\n历史数据范围: {trade_dates_desc[-1]} ~ {trade_dates_desc[0]}")
-    print(f"启动日识别：向后多查{LOOKUP_DAYS}个交易日")
-    print(f"启动日还原打分：板数>={BOARD_THRESHOLD}时触发（4板以上）\n")
+    print(f"启动日识别：向后多查{LOOKUP_DAYS}个交易日\n")
 
     # Step 3: 批量加载融资数据
     print("加载融资数据（批量查询中）...")
@@ -491,9 +451,9 @@ def scan_date(target_date=None):
     print(f"融资数据: {len(margin_df)} 条记录\n")
 
     # Step 4: 逐只分析
-    print(f"{'='*60}")
-    print(f"🔍 第二步信号检验中...")
-    print(f"{'='*60}\n")
+    print(f"{'='*70}")
+    print(f"🔍 T日买入评估中...")
+    print(f"{'='*70}\n")
 
     results = []
     for idx, (_, stock) in enumerate(rise7.iterrows()):
@@ -508,22 +468,11 @@ def scan_date(target_date=None):
             if price_df.empty:
                 continue
 
-            result = analyze_stock(
+            result = analyze_stock_v2(
                 ts_code, name, stock['pct_chg'],
                 target_date, all_calendar, margin_df, price_df
             )
             if result is not None:
-                # ── v1.6新增：4板以上股票触发启动日还原打分 ──
-                if result['board_count'] is not None and result['board_count'] >= BOARD_THRESHOLD:
-                    rescore, rescore_detail = rescore_from_launch(
-                        ts_code, result['launch_date'], all_calendar
-                    )
-                    result['rescore'] = rescore
-                    result['rescore_detail'] = rescore_detail
-                else:
-                    result['rescore'] = None
-                    result['rescore_detail'] = None
-
                 results.append(result)
         except Exception:
             continue
@@ -532,89 +481,121 @@ def scan_date(target_date=None):
         print("无足够数据完成分析")
         return
 
-    df_result = pd.DataFrame(results).sort_values('score', ascending=False)
+    df_result = pd.DataFrame(results)
+    # 按T日总分降序
+    df_result = df_result.sort_values('t_day_score', ascending=False)
 
-    # 打印汇总
-    print(f"\n{'='*100}")
-    print(f"{'代码':<12} {'名称':<8} {'评分':>4} {'背离':>4} {'融资持续':>8} {'缩量':>4} {'涨停':>4}  启动日    板数  综合信号")
-    print('-' * 100)
+    # ═══════════════════════════════════════════════════════════
+    # 打印汇总表
+    # ═══════════════════════════════════════════════════════════
+    print(f"\n{'='*120}")
+    header = (f"{'代码':<12} {'名称':<6} {'T日总分':>6} "
+              f"{'背离':>4} {'缩量':>4} {'象限':>4} {'融资信号':>10} "
+              f"{'启动日':>8} {'板数':>4}  信号说明")
+    print(header)
+    print('-' * 120)
 
     for _, r in df_result.iterrows():
-        signals = []
-        if r['divergence']: signals.append(f"背离{int(r['div_days'])}天")
-        if r['margin_cont']: signals.append(f"融资连增{int(r['cont_days'])}天")
-        if r['shrink']: signals.append("缩量加速")
-        if r['limit_up']: signals.append(f"涨停{int(r['limit_days'])}天")
-        sig_str = ", ".join(signals) if signals else "待观察"
-        star = "⭐" * int(r['score'])
-        board_str = f"{int(r['board_count'])}板" if r['board_count'] else "?"
         launch_str = r['launch_date'][4:] if r['launch_date'] else "?"
+        board_str = f"{int(r['board_count'])}板" if r['board_count'] else "?"
+        margin_sig = r.get('margin_signal_desc', 'N/A')
+        if margin_sig == 'N/A' and r['launch_margin_chg'] is not None:
+            chg = r['launch_margin_chg']
+            if chg > 10:
+                margin_sig = f'+{chg:.1f}%强买入'
+            elif chg < -5:
+                margin_sig = f'{chg:.1f}%否决'
+            else:
+                margin_sig = f'{chg:+.1f}%普通'
+        elif margin_sig == 'N/A':
+            margin_sig = '无数据'
 
-        # v1.6: 如果有还原打分，显示还原分
-        rescore_str = ""
-        if r.get('rescore') is not None and not pd.isna(r['rescore']):
-            rescore_str = f" | 还原{int(r['rescore'])}分"
+        print(f"{r['ts_code']:<12} {r['name']:<6} {int(r['t_day_score']):>6}  "
+              f"{'✓' if r['has_divergence'] else '✗':>4} "
+              f"{'✓' if r['has_volume_shrink'] else '✗':>4} "
+              f"{r['quadrant']:>4} "
+              f"{margin_sig:>10} "
+              f"{launch_str:>8} {board_str:>4}  "
+              f"{r['quadrant_desc']}")
 
-        print(f"{r['ts_code']:<12} {r['name']:<8} {int(r['score']):>4}  "
-              f"{'✓' if r['divergence'] else '✗':>4} "
-              f"{'✓' if r['margin_cont'] else '✗':>8} "
-              f"{'✓' if r['shrink'] else '✗':>4} "
-              f"{'✓' if r['limit_up'] else '✗':>4}  "
-              f"{launch_str:>8}  {board_str:>4}  "
-              f"{star} {sig_str}{rescore_str}")
-
+    # ═══════════════════════════════════════════════════════════
     # 高分详情
-    top = df_result[df_result['score'] >= 2]
+    # ═══════════════════════════════════════════════════════════
+    top = df_result[df_result['t_day_score'] >= 2]
     if not top.empty:
-        print(f"\n{'='*60}")
-        print(f"📊 高分股票详细分析（评分>=2，共{len(top)}只）")
-        print(f"{'='*60}\n")
+        print(f"\n{'='*70}")
+        print(f"📊 T日买入信号详情（总分>=2，共{len(top)}只）")
+        print(f"{'='*70}\n")
         for _, r in top.iterrows():
             board_note = f"，扫到时已是第{int(r['board_count'])}板" if r['board_count'] and r['board_count'] > 1 else ""
-            print(f"[{r['ts_code']}] {r['name']}  扫到日期: {r['scan_date']}")
-            print(f"  {'─'*40}")
-            print(f"  ✅ 真正启动日: {r['launch_date']}（{r['launch_pct']:.2f}%{board_note}）")
-            if r['divergence']:
-                print(f"  ✅ 背离: 股价{r['price_chg']:+.1f}% / 融资余额{r['margin_chg']:+.1f}%（{int(r['div_days'])}天）")
-            if r['margin_cont']:
-                print(f"  ✅ 融资持续增加: 连续{int(r['cont_days'])}天，+{r['margin_increase']:.1f}%")
-            if r['shrink']:
-                print(f"  ✅ 缩量加速: 量比为前期的{r['vol_ratio_change']:.2f}倍")
-            if r['limit_up']:
-                print(f"  ✅ 连续涨停: {int(r['limit_days'])}天")
 
-            # v1.6: 还原打分详情
-            if r.get('rescore') is not None and not pd.isna(r['rescore']):
-                rd = r['rescore_detail']
-                price_chg_str = f"{rd['price_chg']:+.1f}%" if not pd.isna(rd['price_chg']) else "N/A"
-                margin_chg_str = f"{rd['margin_chg']:+.1f}%" if not pd.isna(rd['margin_chg']) else "N/A"
-                margin_inc_str = f"{rd['margin_increase']:+.1f}%" if not pd.isna(rd['margin_increase']) else "N/A"
-                vol_rc_str = f"{rd['vol_ratio_change']:.2f}x" if not pd.isna(rd['vol_ratio_change']) else "N/A"
-                print(f"  🔄 启动日还原打分（4板以上触发）:")
-                print(f"     ① 背离: {'✓' if rd['divergence'] else '✗'} (股价{price_chg_str}, 融资{margin_chg_str}, {int(rd['div_days'])}天)")
-                print(f"     ② 融资持续: {'✓' if rd['margin_cont'] else '✗'} (连续{int(rd['cont_days'])}天, {margin_inc_str})")
-                print(f"     ③ 缩量: {'✓' if rd['shrink'] else '✗'} (量比变化{vol_rc_str})")
-                print(f"     ④ 涨停: {'✓' if rd['limit_up'] else '✗'} ({int(rd['limit_days'])}天)")
-                verdict = '✅ 强信号' if int(r['rescore']) >= 3 else '⚠️ 待观察' if int(r['rescore']) >= 2 else '❌ 低分'
-                print(f"     → 还原总分: {int(r['rescore'])}分 {verdict}")
+            print(f"[{r['ts_code']}] {r['name']}  扫到日期: {r['scan_date']}  T日总分: {int(r['t_day_score'])}")
+            print(f"  {'─'*50}")
 
-                if r['rescore'] < r['score']:
-                    print(f"     ⚠️ 还原分低于山顶分：说明从启动日角度看信号更弱")
-                elif r['rescore'] > r['score']:
-                    print(f"     💡 还原分高于山顶分：说明从启动日角度看该股本来就应该得高分，只是被山顶视角低估")
+            # T日买入评估
+            print(f"  🎯 T日买入评估:")
+            print(f"     ① 背离验证: {'✓' if r['has_divergence'] else '✗'} "
+                  f"(股价{r['price_chg']:+.1f}% / 融资{r['margin_chg']:+.1f}%，{int(r['div_days'])}天)")
 
-            print(f"  {'🎯' if r['score'] >= 3 else '👀'} 结论: {'强信号，三步验证接近完成' if r['score'] >= 3 else '中强信号，等待第三步确认'}")
+            vol_r = f"{r['vol_ratio_tday']:.2f}" if r['vol_ratio_tday'] else "N/A"
+            vol_m = f"{r['vol_ma5_before']:.2f}" if r['vol_ma5_before'] else "N/A"
+            print(f"     ② 量比验证: {'✓' if r['has_volume_shrink'] else '✗'} "
+                  f"(T日量比={vol_r} vs 前期均值={vol_m})")
+
+            print(f"     ③ 象限分类: {r['quadrant']} {r['quadrant_desc']} "
+                  f"(启动前5日涨幅={r['pre5_chg']:+.1f}%)")
+
+            margin_sig = r.get('margin_signal_desc', 'N/A')
+            if margin_sig == 'N/A' and r['launch_margin_chg'] is not None:
+                chg = r['launch_margin_chg']
+                if chg > 10:
+                    margin_sig = f'+{chg:.1f}% 强烈买入'
+                elif chg < -5:
+                    margin_sig = f'{chg:.1f}% 否决'
+                else:
+                    margin_sig = f'{chg:+.1f}% 普通'
+            print(f"     ④ 启动日融资: {margin_sig}")
+
+            # T+1持有评估
+            print(f"  📈 T+1持有评估（买入后使用，不用于买入决策）:")
+            print(f"     ① 融资持续: {'✓' if r['has_cont'] else '✗'} (连续{int(r['cont_days'])}天, {r['margin_increase']:+.1f}%)")
+            print(f"     ② 缩量加速: {'✓' if r['has_shrink'] else '✗'} (量比变化{r['vol_ratio_change']:.2f}x)")
+            print(f"     ③ 连续涨停: {'✓' if r['has_limit'] else '✗'} ({int(r['limit_days'])}天)")
+
+            # 结论
+            print(f"  ✅ 结论: {r['name']} 启动日{r['launch_date']}（{r['launch_pct']:.1f}%{board_note}）")
+            if r['quadrant'] == 'A':
+                print(f"     → 象限A，最优先买入，T日总分{int(r['t_day_score'])}分")
+            elif r['quadrant'] == 'B':
+                print(f"     → 象限B，谨慎买入")
+            elif r['quadrant'] == 'Baux':
+                print(f"     → 象限Baux，隐形建仓买入（融资持续增{int(r['margin_long_chg']):+.0f}%）")
+            elif r['quadrant'] == 'C':
+                print(f"     → 象限C，小仓位短线")
+            else:
+                print(f"     → 象限D，不建议买入")
             print()
 
-    print(f"\n{'='*60}")
-    print(f"评分规则: 背离(1) + 融资持续(1) + 缩量加速(1) + 连续涨停(1)")
-    print(f"背离: 启动日前，股价跌+融资余额增，持续{MARGIN_DIVERGENCE_DAYS}+天")
-    print(f"融资持续: 启动日后连续{CONTINUOUS_MARGIN_DAYS}天融资余额增加")
-    print(f"缩量加速: 股价涨但量比下降")
-    print(f"连续涨停: 启动日+次日均有涨停")
-    print(f"启动日定义: 前一天涨幅≤5% 且 当天涨幅≥7%")
-    print(f"启动日还原打分: 4板以上股票额外从启动日角度重新打分")
-    print(f"{'='*60}")
+    # ═══════════════════════════════════════════════════════════
+    # 信号规则说明
+    # ═══════════════════════════════════════════════════════════
+    print(f"\n{'='*70}")
+    print(f"T日买入评估（0~4分，只用T-1及之前 + T日当天数据）:")
+    print(f"  ① 背离验证（1分）：启动前最后10日窗口内股价跌/融资余额增，持续>=3天")
+    print(f"     v2.1修复：改用启动前最后10日窗口，避免中间大幅波动切断判断")
+    print(f"  ② 量比验证（1分）：T日上涨但量比 < 前期均量（缩量上涨）")
+    print(f"  ③ 启动日融资变化（0~2分）：>+10%强烈买入，<-5%否决")
+    print(f"\nT+1持有评估（买入后使用，不用于买入决策）:")
+    print(f"  ① 融资持续：启动日后连续3天融资余额增加")
+    print(f"  ② 缩量加速：持有期股价涨但量比持续下降")
+    print(f"  ③ 连续涨停：启动日+次日均有涨停")
+    print(f"\n象限分类（用于描述性分类，不直接加到总分）:")
+    print(f"  ★ 象限A：启动前涨幅>5% + 有实质背离 → 最优先买入")
+    print(f"  △ 象限B：启动前涨幅<-5% + 启动日融资>10% → 谨慎买入")
+    print(f"  ☆ 象限Baux：启动前融资持续增长+25%但股价不涨 + 启动日融资温和增加 → 隐形建仓买入")
+    print(f"  ◇ 象限C：启动前涨幅>5% + 无实质背离 → 小仓位短线")
+    print(f"  ○ 象限D：不属于A/B/Baux/C → 坚决不买")
+    print(f"{'='*70}")
 
 
 if __name__ == '__main__':
