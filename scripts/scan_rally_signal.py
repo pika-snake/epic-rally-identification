@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v2.2 — T日买入评估 + T+1持有评估
+史诗级行情扫描器 v2.8 — T日买入评估 + T+1持有评估
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
 - T+1持有评估：使用 T+1及之后 数据（买入后用来判断要不要持有）
 
-T日买入评估（0~4分）：
+T日买入评估（0~4分 + 融资四维度 + 月线过热过滤）：
   ① 背离验证（1分）：启动前股价跌/融资余额增，持续>=5天
      v2.1修复：改用"启动前最后10日窗口"，避免中间大幅波动切断背离判断
   ② 量比验证（1分）：T日量比 < 前5日均量（缩量上涨）
@@ -15,6 +15,14 @@ T日买入评估（0~4分）：
      - 启动日融资余额较前一交易日 >+10% → 强烈买入信号
      - 启动日融资余额较前一交易日 <-5% → 否决信号
      - 中间值 → 普通信号
+  ⑤ 融资正天数占比（v2.7）：30日净买入正天数>=65% → 黑马特征
+  ⑥ 启动前5日融资增幅（v2.7）：<20% → 黑马特征（蜗牛>40%）
+  ⑦ 30日融资净买总额（v2.7）：>0 → 辅助参考（负值多为蜗牛）
+  ⑧ 5日净买占30日比例（v2.7）：<80% → 均匀建仓型；>80% → 冲刺型
+  ⑨ 月线过热过滤（v2.8新增，硬过滤）：
+     - 启动前1月涨幅 >20% → 短期过热，排除
+     - 启动前2月涨幅 >60%/80%（月线多头时放宽到80%）
+     - 黑马特征：月线上升通道 OR 历史低位启动，稳健不过热
 
 T+1持有评估（买入后使用，不用于买入决策）：
   ① 融资持续：买入后连续3天融资余额增加
@@ -44,11 +52,20 @@ import numpy as np
 
 # ========== 配置 ==========
 TOKEN = 'fe284a8656a25bf46f4b9092178d1a4dd4d63f26bdb8b83d7f461c47'
-TRADE_DAYS_BACK = 30    # 往前查多少个交易日做背离分析
+TRADE_DAYS_BACK = 60    # 往前查多少个交易日做背离分析（60日才能捕捉慢建仓型，如603318水发燃气）
 MIN_RISE_PCT = 7.0      # 涨幅门槛（%）
 MARGIN_DIVERGENCE_DAYS = 5  # 背离需要持续多少天
 CONTINUOUS_MARGIN_DAYS = 3  # 启动后融资余额需连续增加天数
 LOOKUP_DAYS = 5         # 向后多查多少个交易日找启动日（默认5个）
+# v2.7新增融资四维度的阈值（基于黑马vs蜗牛后验分析）
+MARGIN_POS_DAYS_RATIO_THRESH = 0.65   # 30日融资净买入为正天数占比阈值（黑马>=65%）
+MARGIN_CHG_5D_THRESH = 20.0           # 启动前5日融资增幅上限（黑马<20%，蜗牛>40%）
+MARGIN_NET_30D_POSITIVE = True        # v2.7修正：30日融资净买总额>0（排除负值蜗牛）
+MARGIN_5D_NET_RATIO_THRESH = 0.80     # 5日净买占30日净买比例上限（>80%=冲刺型，<50%=均匀建仓）
+# v2.8新增月线过热维度阈值（基于月线趋势区分黑马vs蜗牛）
+PRE_1M_CHG_THRESH = 20.0             # 启动前1月涨幅上限（>20%=短期过热，排除蜗牛）
+PRE_2M_CHG_THRESH = 60.0            # 启动前2月涨幅上限（非月线多头时）
+PRE_2M_CHG_THRESH_BULL = 80.0       # 启动前2月涨幅上限（月线多头时，放宽20%）
 # =========================
 
 pro = ts.pro_api(TOKEN)
@@ -68,6 +85,83 @@ def get_trade_dates_asc(start_date, n=5):
     cal = pro.trade_cal(exchange='SSE', start_date=start_date, end_date=end_dt.strftime('%Y%m%d'))
     dates = cal[cal['is_open'] == 1]['cal_date'].tolist()
     return sorted([d for d in dates if d >= start_date])[:n]
+
+
+def get_monthly_close(ts_code, launch_date, months=4):
+    """获取启动日前月线状态和过热维度（1月/2月涨幅）
+    Args:
+        ts_code: 股票代码
+        launch_date: 启动日（YYYYMMDD格式）
+        months: 未使用，保留参数
+    Returns: {'pre_1m_chg': float, 'pre_2m_chg': float, 'ma_bullish': bool,
+              'price_above_ma5': bool, 'overheat_1m': bool, 'overheat_2m': bool}
+    """
+    # 直接查全部历史（不需要start_date，MA20只需要20个月，自然有足够数据）
+    mdf = pro.monthly(ts_code=ts_code, end_date='20260531')
+    mdf = mdf.sort_values('trade_date')
+    mdf['close'] = mdf['close'].astype(float)
+    mdf['ma5'] = mdf['close'].rolling(5).mean()
+    mdf['ma10'] = mdf['close'].rolling(10).mean()
+    mdf['ma20'] = mdf['close'].rolling(20).mean()
+    mdf = mdf.dropna()
+    if len(mdf) < 4:
+        return None
+
+    # 启动日所在月（launch_date格式YYYYMMDD）
+    launch_month_str = launch_date[:6]  # 'YYYYMM'
+    launch_dt = pd.to_datetime(launch_date)
+
+    # 找启动日之前的最近一个月末
+    mdf['trade_date_str'] = mdf['trade_date'].astype(str)
+    prev_month_rows = mdf[mdf['trade_date_str'] < launch_month_str]
+    if prev_month_rows.empty:
+        return None
+    last_month_row = prev_month_rows.iloc[-1]  # 最近一个已记录的月末
+
+    # 最近第2个已记录月末
+    if len(prev_month_rows) < 2:
+        return None
+    second_last_row = prev_month_rows.iloc[-2]  # 第2个已记录月末
+
+    # 最近第3个已记录月末（用于计算2月涨幅）
+    if len(prev_month_rows) < 3:
+        return None
+    third_last_row = prev_month_rows.iloc[-3]
+
+    # 月线多头判断（最近一个已记录月末）
+    ma_bullish = (float(last_month_row['ma5']) > float(last_month_row['ma10']) > float(last_month_row['ma20']))
+    price_above_ma5 = (float(last_month_row['close']) > float(last_month_row['ma5']))
+
+    # 月末收盘
+    last_close = float(last_month_row['close'])        # 最近月末 = 3月末(20260331)
+    second_close = float(second_last_row['close'])     # 第2个月末 = 2月末(20260227)
+    third_close = float(third_last_row['close'])       # 第3个月末 = 1月末(20260130)
+
+    # 启动日收盘
+    try:
+        ddf = pro.daily(ts_code=ts_code, start_date=launch_date, end_date=launch_date)
+        launch_close = float(ddf['close'].iloc[0])
+    except Exception:
+        launch_close = last_close
+
+    # 1月涨幅 = (启动日收盘 / 3月末收盘 - 1) * 100
+    pre_1m_chg = (launch_close / last_close - 1) * 100 if last_close > 0 else 0.0
+    # 2月涨幅 = (启动日收盘 / 1月末收盘 - 1) * 100
+    pre_2m_chg = (launch_close / third_close - 1) * 100 if third_close > 0 else 0.0
+
+    # 过热判断
+    threshold_2m = PRE_2M_CHG_THRESH_BULL if (ma_bullish and price_above_ma5) else PRE_2M_CHG_THRESH
+    overheat_1m = pre_1m_chg > PRE_1M_CHG_THRESH
+    overheat_2m = pre_2m_chg > threshold_2m
+
+    return {
+        'pre_1m_chg': pre_1m_chg,
+        'pre_2m_chg': pre_2m_chg,
+        'ma_bullish': ma_bullish,
+        'price_above_ma5': price_above_ma5,
+        'overheat_1m': overheat_1m,
+        'overheat_2m': overheat_2m,
+    }
 
 
 def load_all_margin_data(trade_dates):
@@ -289,7 +383,60 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
                 margin_signal = 1   # 普通信号
                 margin_signal_desc = f'{launch_margin_chg:+.1f}% 普通'
 
-    # ── ③ 象限分类（使用启动日前数据）────────────
+    # ═══════════════════════════════════════════════════════════
+    # v2.7新增：融资三维度（黑马vs蜗牛后验发现的关键差异）
+    # 数据窗口：启动前30日融资数据
+    # ═══════════════════════════════════════════════════════════
+    margin_before_30d = margin_before_ts[
+        margin_before_ts['trade_date'] >= (
+            pd.to_datetime(launch_date) - pd.Timedelta(days=45)
+        ).strftime('%Y%m%d')
+    ].sort_values('trade_date')
+
+    # 维度1：30日融资净买入为正天数占比（黑马>=65%，蜗牛<=61%）
+    margin_pos_days_ratio = 0.0
+    if len(margin_before_30d) >= 15:
+        # 当日净买入 ≈ rzmre - rzche（融资买入 - 融资偿还）
+        margin_before_30d = margin_before_30d.copy()
+        margin_before_30d['daily_net'] = (
+            margin_before_30d['rzmre'] - margin_before_30d['rzche']
+        )
+        pos_days = (margin_before_30d['daily_net'] > 0).sum()
+        total_days = len(margin_before_30d)
+        margin_pos_days_ratio = pos_days / total_days if total_days > 0 else 0.0
+
+    # 维度2：启动前5日融资增幅（黑马<20%，蜗牛>40%）
+    # 用前5日（启动日之前最近5个交易日，对应pre5窗口）
+    pre5_margin = margin_before_30d.tail(5).sort_values('trade_date')
+    margin_chg_5d = 0.0
+    if len(pre5_margin) >= 3:
+        rzye_start = pre5_margin['rzye_yi'].iloc[0]
+        rzye_end   = pre5_margin['rzye_yi'].iloc[-1]
+        if rzye_start > 0:
+            margin_chg_5d = (rzye_end / rzye_start - 1) * 100
+
+    # 维度3：30日融资净买总额（辅助参考）
+    margin_net_30d = 0.0
+    if len(margin_before_30d) >= 5:
+        margin_before_30d = margin_before_30d.copy()
+        margin_before_30d['daily_net'] = (
+            margin_before_30d['rzmre'] - margin_before_30d['rzche']
+        )
+        margin_net_30d = margin_before_30d['daily_net'].sum()
+
+    # 维度4（v2.7修正）：5日净买占30日净买比例（>80%=冲刺型，<50%=均匀建仓）
+    margin_net_5d = 0.0
+    if len(pre5_margin) >= 3:
+        pre5_margin = pre5_margin.copy()
+        pre5_margin['daily_net'] = (
+            pre5_margin['rzmre'] - pre5_margin['rzche']
+        )
+        margin_net_5d = pre5_margin['daily_net'].sum()
+    margin_net_5d_ratio = 0.0
+    if margin_net_30d > 0:
+        margin_net_5d_ratio = margin_net_5d / margin_net_30d  # 正数才有意义
+
+    # ── 象限分类（使用启动日前数据）────────────
     # Baux新增：启动前融资持续增长但股价几乎不涨（隐形建仓型）
     # 计算启动前30日融资变化（捕捉长期无声建仓）
     margin_before_sorted = margin_before_ts.sort_values('trade_date')
@@ -298,22 +445,35 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     else:
         margin_long_chg = 0.0
 
+    # ── 启动前最后10日窗口（v2.6统一，和背离算法一致）────────────
+    # 用启动日前10日窗口来计算pre5，避免中间大幅波动切断判断
+    DIV_WINDOW = 10
+    price_before_launch = price_df[price_df['trade_date'] < launch_date].copy()
+    price_before_launch = price_before_launch.sort_values('trade_date').reset_index(drop=True)
+    last_10_window = price_before_launch.tail(DIV_WINDOW)
+
     # 启动前5日涨幅（启动日之前最近5个交易日）
-    pre5 = price_df[price_df['trade_date'] < launch_date].tail(5)
+    pre5 = last_10_window.tail(5)
     pre5_chg = 0.0
     if len(pre5) >= 3:
         pre5_chg = (pre5['close'].iloc[-1] / pre5['close'].iloc[0] - 1) * 100
 
     # 启动前5日最大单日涨幅（用于Baux排除有明显异动的股票）
+    # v2.6：这里也要用last_10_window，避免中间异常波动干扰
     pre5_max_day = 0.0
     if len(pre5) >= 2:
-        pre5['daily_return'] = pre5['close'].pct_change() * 100
-        pre5_max_day = pre5['daily_return'].max()
+        pre5_with_ret = pre5.copy()
+        pre5_with_ret['daily_return'] = pre5_with_ret['close'].pct_change() * 100
+        pre5_max_day = pre5_with_ret['daily_return'].max()
 
     quadrant = None
     quadrant_desc = None
-    # 启动前有明显异动（有任一单日涨幅>=5%）：A/B/Baux直接否决，都归D
+    # 启动前有明显异动（有任一单日涨跌幅>=5%）
+    # 注意：这里区分"纯炒作型异动"和"建仓型异动"
+    # 建仓型异动：往往是借市场利空（大盘跌）洗盘，融资反而持续增长 → 不应直接否决
+    # 纯炒作型异动：无利好无缘无故大涨大跌，融资不跟 → 坚决否决
     has_pre_suspicious = pre5_max_day >= 5
+    has_pre_drop_5 = pre5_max_day <= -5  # 借利空挖坑型（大盘跌时跟跌）
 
     if has_divergence and pre5_chg > 5 and not has_pre_suspicious:
         quadrant = 'A'
@@ -321,10 +481,19 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     elif pre5_chg < -5 and launch_margin_chg is not None and launch_margin_chg > 10:
         quadrant = 'B'
         quadrant_desc = '△ 谨慎买入（启动日融资>10%）'
-    elif margin_long_chg > 25 and pre5_chg < 10 and pre5_max_day < 5 and launch_margin_chg is not None and launch_margin_chg > 3:
-        # Baux：隐形建仓型 — 启动前融资持续增长+25%以上，股价几乎不涨（总涨幅<10%且无单日异动），启动日融资温和增加>3%
-        quadrant = 'Baux'
-        quadrant_desc = '☆ 隐形建仓（融资持续增）'
+    elif margin_long_chg > 25 and pre5_chg < 10 and launch_margin_chg is not None and launch_margin_chg > 3:
+        # Baux：隐形建仓型
+        # v2.6修复：移除 pre5_max_day < 5 的硬性排除
+        # 原因：启动前借利空挖坑（单日大跌）≠ 纯炒作型异动
+        # 真正的纯炒作：无缘无故单日暴涨；建仓型：大跌后缩量横盘
+        # 判断标准：若有单日异动>=5%，要求融资长期增长>40%（强建仓信号）才过
+        if pre5_max_day >= 5:
+            if margin_long_chg >= 40:
+                quadrant = 'Baux'
+                quadrant_desc = '☆ 隐形建仓（融资持续增，建仓型异动）'
+        else:
+            quadrant = 'Baux'
+            quadrant_desc = '☆ 隐形建仓（融资持续增）'
     elif pre5_chg > 5 and pre5_chg < 10 and not has_divergence and not has_pre_suspicious:
         quadrant = 'C'
         quadrant_desc = '◇ 小仓位短线'
@@ -336,6 +505,36 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     # 背离(0/1) + 量比(0/1) + 启动日融资(0/1/2)
     # 象限用于描述性分类，不直接加到总分（决定是否值得买）
     t_day_score = int(has_divergence) + int(has_volume_shrink) + margin_signal
+
+    # ═══════════════════════════════════════════════════════════
+    # v2.8新增：月线过热维度（启动前1月/2月涨幅判断，排除蜗牛）
+    # 逻辑：黑马稳健启动（1月<20%，2月<60%/80%），蜗牛过热必崩
+    # ═══════════════════════════════════════════════════════════
+    overheat_1m = False
+    overheat_2m = False
+    pre_1m_chg = 0.0
+    pre_2m_chg = 0.0
+    ma_bullish = False
+    price_above_ma5 = False
+
+    monthly_data = get_monthly_close(ts_code, launch_date, months=4)
+    if monthly_data is not None:
+        ma_bullish = monthly_data['ma_bullish']
+        price_above_ma5 = monthly_data['price_above_ma5']
+        pre_1m_chg = monthly_data['pre_1m_chg']
+        pre_2m_chg = monthly_data['pre_2m_chg']
+        overheat_1m = monthly_data['overheat_1m']
+        overheat_2m = monthly_data['overheat_2m']
+    else:
+        ma_bullish = False
+        price_above_ma5 = False
+        pre_1m_chg = 0.0
+        pre_2m_chg = 0.0
+        overheat_1m = False
+        overheat_2m = False
+
+    # 过热硬过滤：短期或中期过热 → 标记为排除
+    is_overheat_excluded = overheat_1m or overheat_2m
 
     # ═══════════════════════════════════════════════════════════
     # T+1持有评估（使用启动日后数据，包括T+1）
@@ -406,6 +605,21 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         'margin_signal': margin_signal,
         'launch_margin_chg': launch_margin_chg,
         'margin_signal_desc': margin_signal_desc,
+
+        # v2.7新增融资三维度（+维度4）
+        'margin_pos_days_ratio': margin_pos_days_ratio,   # 维度1：30日净买入正天数占比
+        'margin_chg_5d': margin_chg_5d,                  # 维度2：启动前5日融资增幅
+        'margin_net_30d': margin_net_30d,                 # 维度3：30日融资净买总额(亿)
+        'margin_net_5d_ratio': margin_net_5d_ratio,      # 维度4：5日净买占30日比例
+
+        # v2.8新增月线过热维度
+        'is_overheat_excluded': is_overheat_excluded,     # 硬过滤：过热排除
+        'overheat_1m': overheat_1m,                      # 启动前1月过热
+        'overheat_2m': overheat_2m,                      # 启动前2月过热
+        'pre_1m_chg': pre_1m_chg,                        # 启动前1月涨幅%
+        'pre_2m_chg': pre_2m_chg,                        # 启动前2月涨幅%
+        'ma_bullish': ma_bullish,                         # 月线多头排列
+        'price_above_ma5': price_above_ma5,              # 价格在MA5上方
 
         # T+1持有评估
         'has_cont': has_cont,
@@ -531,7 +745,7 @@ def scan_date(target_date=None):
     # ═══════════════════════════════════════════════════════════
     # 高分详情
     # ═══════════════════════════════════════════════════════════
-    top = df_result[df_result['t_day_score'] >= 2]
+    top = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded'])]
     if not top.empty:
         print(f"\n{'='*70}")
         print(f"📊 T日买入信号详情（总分>=2，共{len(top)}只）")
@@ -565,6 +779,28 @@ def scan_date(target_date=None):
                 else:
                     margin_sig = f'{chg:+.1f}% 普通'
             print(f"     ④ 启动日融资: {margin_sig}")
+
+            # v2.7新增：融资四维度（黑马vs蜗牛的核心差异）
+            # 注意：margin_net_30d 单位是"元"，需要除以1e8转亿
+            ratio_pct = r['margin_pos_days_ratio'] * 100
+            pos_days_pass = "✓" if r['margin_pos_days_ratio'] >= MARGIN_POS_DAYS_RATIO_THRESH else "✗"
+            chg5d_pass = "✓" if r['margin_chg_5d'] < MARGIN_CHG_5D_THRESH else "✗"
+            net30_yi = r['margin_net_30d'] / 1e8  # 转为亿
+            net30_pass = "✓" if MARGIN_NET_30D_POSITIVE and r['margin_net_30d'] > 0 else ("N/A" if not MARGIN_NET_30D_POSITIVE else "✗")
+            net5d_ratio_pct = r['margin_net_5d_ratio'] * 100
+            net5d_pass = "✓" if r['margin_net_5d_ratio'] < MARGIN_5D_NET_RATIO_THRESH else "✗"
+            print(f"     ⑤ 融资正天数占比: {pos_days_pass} {ratio_pct:.0f}% (阈值>={MARGIN_POS_DAYS_RATIO_THRESH*100:.0f}%)")
+            print(f"     ⑥ 启动前5日融资增幅: {chg5d_pass} {r['margin_chg_5d']:+.1f}% (阈值<{MARGIN_CHG_5D_THRESH:.0f}%)")
+            print(f"     ⑦ 30日融资净买总额: {net30_yi:+.2f}亿 ({net30_pass})")
+            print(f"     ⑧ 5日净买占30日比例: {net5d_pass} {net5d_ratio_pct:.0f}% (阈值<{MARGIN_5D_NET_RATIO_THRESH*100:.0f}%)")
+
+            # v2.8新增：月线过热维度
+            if r['is_overheat_excluded']:
+                print(f"     ⚠️ 月线过热过滤: ✗ 排除（1月{r['pre_1m_chg']:+.1f}% 2月{r['pre_2m_chg']:+.1f}%）")
+            else:
+                bull_mark = "✓" if r['ma_bullish'] else "✗"
+                threshold_2m = PRE_2M_CHG_THRESH_BULL if (r['ma_bullish'] and r['price_above_ma5']) else PRE_2M_CHG_THRESH
+                print(f"     ⑨ 月线过热过滤: ✓ 通过（月线多头{bull_mark}，1月{r['pre_1m_chg']:+.1f}%<{PRE_1M_CHG_THRESH:.0f}%，2月{r['pre_2m_chg']:+.1f}%<{threshold_2m:.0f}%）")
 
             # T+1持有评估
             print(f"  📈 T+1持有评估（买入后使用，不用于买入决策）:")
