@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v3.9 — T日买入评估 + T+1持有评估
+史诗级行情扫描器 v4.0 — T日买入评估 + T+1持有评估
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -11,7 +11,7 @@
     不带参数默认上一个交易日
     -v/--verify: 验证模式，对Baux/B/A象限候选股输出月线+融资结构+启动后走势汇总
 
-T日买入评估（0~4分 + 融资四维度 + 月线过热过滤 + v3.8涨幅过滤）：
+T日买入评估（0~4分 + 融资四维度 + 月线过热过滤 + v4.0涨跌过滤）：
   ① 背离验证（1分）：启动前股价跌/融资余额增，持续>=5天
      v2.1修复：改用"启动前最后10日窗口"，避免中间大幅波动切断背离判断
   ② 量比验证（1分）：T日量比 < 前5日均量（缩量上涨）
@@ -28,8 +28,8 @@ T日买入评估（0~4分 + 融资四维度 + 月线过热过滤 + v3.8涨幅过
      - 启动前1月涨幅 >20% → 短期过热，排除
      - 启动前2月涨幅 >60%/80%（月线多头时放宽到80%）
      - 黑马特征：月线上升通道 OR 历史低位启动，稳健不过热
-  ⓘ v3.8新增：启动前10日涨幅>=5%天数>=2 → 排除（短期炒作型）
-     逻辑：10日内2天及以上涨幅>=5%说明有短线活跃资金，不符合安静建仓型
+  ⓘ v4.0：启动前8日涨跌绝对值>=5%天数>=2 → 排除（短期炒作型）
+     逻辑：8日内2天及以上涨跌超5%说明有短线活跃资金，不符合安静建仓型
   ⑩ 大单资金过滤（v3.6新增，硬过滤）：
      - 启动日大单+超大单净量 <=0亿 → 无条件排除（主力出逃）
      - 数据来源：tushare moneyflow接口（buy_lg_amount/sell_lg_amount/buy_elg_amount/sell_elg_amount）
@@ -500,39 +500,36 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     else:
         margin_long_chg = 0.0
 
-    # ── 启动前最后10日窗口（v2.6统一，和背离算法一致）────────────
-    # 用启动日前10日窗口来计算pre5，避免中间大幅波动切断判断
-    DIV_WINDOW = 10
+    # ── v4.0：启动前8日涨幅绝对值>=5%天数过滤 ─────────────────────────
+    # 逻辑：启动日之前8个交易日内，涨幅绝对值>=5%的天数>=2天 → 排除
+    # 排除这类股票，避免把短线炒作误判为黑马启动
+    # 重要：启动日本身（涨幅>=7%的涨停日）不纳入统计，"安静建仓"的"安静"指的是启动日之前
+    # v3.8/v3.9: 原用10日窗口+仅看涨幅>=5%；v4.0: 缩小到8日+绝对值（包含下跌日）
+    DIV_WINDOW = 8
     price_before_launch = price_df[price_df['trade_date'] < launch_date].copy()
     price_before_launch = price_before_launch.sort_values('trade_date').reset_index(drop=True)
-    last_10_window = price_before_launch.tail(DIV_WINDOW)
+    last_8_window = price_before_launch.tail(DIV_WINDOW)
 
     # 启动前5日涨幅（启动日之前最近5个交易日）
-    pre5 = last_10_window.tail(5)
+    pre5 = last_8_window.tail(5)
     pre5_chg = 0.0
     if len(pre5) >= 3:
         pre5_chg = (pre5['close'].iloc[-1] / pre5['close'].iloc[0] - 1) * 100
 
     # 启动前5日最大单日涨幅（用于Baux排除有明显异动的股票）
-    # v2.6：这里也要用last_10_window，避免中间异常波动干扰
     pre5_max_day = 0.0
     if len(pre5) >= 2:
         pre5_with_ret = pre5.copy()
         pre5_with_ret['daily_return'] = pre5_with_ret['close'].pct_change() * 100
         pre5_max_day = pre5_with_ret['daily_return'].max()
 
-    # ── v3.8新增：启动前10日涨幅≥5%天数过滤 ──────────────────────────
-    # 逻辑：启动日之前10个交易日内，有2天及以上涨幅≥5%，说明有短期活跃资金，不是安静建仓型
-    # 排除这类股票，避免把短线炒作误判为黑马启动
-    # 重要：启动日本身（涨幅≥7%的涨停日）不纳入统计，"安静建仓"的"安静"指的是启动日之前
-    # v3.8.1修复：改用pct_chg列（真实单日涨跌幅），避免close.pct_change()第一行因无前一日数据变成NaN导致漏算
-    # v3.9: 显式排除launch_date本身，确保启动日不计入（防呆保险）
-    pre10_rise5_days = 0
-    if len(last_10_window) >= 2:
-        # last_10_window 已通过 trade_date < launch_date 过滤，启动日不在其中
-        # 再次保险：显式排除 launch_date（防字符串比较万一出问题）
-        window_excl_launch = last_10_window[last_10_window['trade_date'] != launch_date]
-        pre10_rise5_days = (window_excl_launch['pct_chg'] >= 5).sum()
+    # ── v4.0：启动前8日涨幅绝对值>=5%天数过滤 ─────────────────────────
+    pre8_rise5_abs_days = 0
+    if len(last_8_window) >= 2:
+        # last_8_window 已通过 trade_date < launch_date 过滤，启动日不在其中
+        # 显式排除 launch_date（防呆保险）
+        window_excl_launch = last_8_window[last_8_window['trade_date'] != launch_date]
+        pre8_rise5_abs_days = (window_excl_launch['pct_chg'].abs() >= 5).sum()
 
     quadrant = None
     quadrant_desc = None
@@ -687,7 +684,7 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         'quadrant_desc': quadrant_desc,
         'pre5_chg': pre5_chg,
         'pre5_max_day': pre5_max_day,
-        'pre10_rise5_days': pre10_rise5_days,
+        'pre8_rise5_abs_days': pre8_rise5_abs_days,
         'margin_long_chg': margin_long_chg,
         'margin_signal': margin_signal,
         'launch_margin_chg': launch_margin_chg,
@@ -834,7 +831,7 @@ def scan_date(target_date=None, verify_mode=False):
     # ═══════════════════════════════════════════════════════════
     # 高分详情
     # ═══════════════════════════════════════════════════════════
-    top = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre10_rise5_days'] < 2)]
+    top = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre8_rise5_abs_days'] < 2)]
     # v2.9: 收集Baux/B/A候选用于验证模式
     verify_candidates = []
     for _, r in top.iterrows():
@@ -863,9 +860,9 @@ def scan_date(target_date=None, verify_mode=False):
             print(f"     ③ 象限分类: {r['quadrant']} {r['quadrant_desc']} "
                   f"(启动前5日涨幅={r['pre5_chg']:+.1f}%)")
 
-            # v3.8新增：启动前10日涨幅≥5%天数过滤
-            print(f"     ⓘ v3.8过滤: 10日涨幅≥5%天数={int(r['pre10_rise5_days'])}天"
-                  f"{' ✗排除' if r['pre10_rise5_days'] >= 2 else ' ✓通过'}")
+            # v4.0：启动前8日涨幅绝对值>=5%天数过滤
+            print(f"     ⓘ v4.0过滤: 8日涨跌绝对值≥5%天数={int(r['pre8_rise5_abs_days'])}天"
+                  f"{' ✗排除' if r['pre8_rise5_abs_days'] >= 2 else ' ✓通过'}")
 
             margin_sig = r.get('margin_signal_desc', 'N/A')
             if margin_sig == 'N/A' and r['launch_margin_chg'] is not None:
