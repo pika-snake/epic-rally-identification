@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v3.8 — T日买入评估 + T+1持有评估
+史诗级行情扫描器 v3.8.1 — T日买入评估 + T+1持有评估
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -524,11 +524,10 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     # ── v3.8新增：启动前10日涨幅≥5%天数过滤 ──────────────────────────
     # 逻辑：10日内有2天及以上涨幅≥5%，说明有短期活跃资金，不是安静建仓型
     # 排除这类股票，避免把短线炒作误判为黑马启动
+    # v3.8.1修复：改用pct_chg列（真实单日涨跌幅），避免close.pct_change()第一行因无前一日数据变成NaN导致漏算
     pre10_rise5_days = 0
     if len(last_10_window) >= 2:
-        pre10_with_ret = last_10_window.copy()
-        pre10_with_ret['daily_return'] = pre10_with_ret['close'].pct_change() * 100
-        pre10_rise5_days = (pre10_with_ret['daily_return'] >= 5).sum()
+        pre10_rise5_days = (last_10_window['pct_chg'] >= 5).sum()
 
     quadrant = None
     quadrant_desc = None
