@@ -63,10 +63,15 @@ MARGIN_DIVERGENCE_DAYS = 5  # 背离需要持续多少天
 CONTINUOUS_MARGIN_DAYS = 3  # 启动后融资余额需连续增加天数
 LOOKUP_DAYS = 5         # 向后多查多少个交易日找启动日（默认5个）
 # v2.7新增融资四维度的阈值（基于黑马vs蜗牛后验分析）
-MARGIN_POS_DAYS_RATIO_THRESH = 0.65   # 30日融资净买入为正天数占比阈值（黑马>=65%）
+# v3.4修正：
+#   - 正天数阈值0.65→0.55（黑马边界案例如600487在数据不足时仅48%，调低捕获边缘黑马）
+#   - 新增5日净买绝对规模阈值（5日净买<5亿=均匀建仓，>5亿=冲刺型）
+#   - 5D/30D比例仅在30日净买>=5亿时有意义（避免小分母导致ratio失真）
+MARGIN_POS_DAYS_RATIO_THRESH = 0.55   # 30日融资净买入为正天数占比阈值（黑马>=55%）
 MARGIN_CHG_5D_THRESH = 20.0           # 启动前5日融资增幅上限（黑马<20%，蜗牛>40%）
-MARGIN_NET_30D_POSITIVE = True        # v2.7修正：30日融资净买总额>0（排除负值蜗牛）
-MARGIN_5D_NET_RATIO_THRESH = 0.80     # 5日净买占30日净买比例上限（>80%=冲刺型，<50%=均匀建仓）
+MARGIN_NET_30D_POSITIVE = True        # 30日融资净买总额>0（排除负值蜗牛）
+MARGIN_5D_NET_ABS_THRESH = 5.0        # v3.4新增：5日净买绝对规模上限（亿），>5亿=冲刺型
+MARGIN_5D_NET_RATIO_THRESH = 0.80     # 5日净买占30日净买比例（>80%=冲刺型，仅在30日净买>=5亿时有效）
 # v2.9新增：月线过热维度阈值（基于月线趋势区分黑马vs蜗牛）
 PRE_1M_CHG_THRESH = 20.0             # 启动前1月涨幅上限（>20%=短期过热，排除蜗牛）
 PRE_1M_WARM_THRESH = 25.0            # v3.0缓冲带上限（20%~25%为"观察"级别，不直接排除）
@@ -78,8 +83,12 @@ pro = ts.pro_api(TOKEN)
 
 
 def get_trade_dates_desc(end_date, n=30):
-    """获取end_date前n个交易日列表（降序，最新在前）"""
-    start_dt = pd.to_datetime(end_date) - pd.Timedelta(days=60)
+    """获取end_date前n个交易日列表（降序，最新在前）
+    v3.4修复：改用end_date往前推n个交易日的逻辑，而不是固定60个自然日
+    """
+    # 粗略估计：n个交易日大约需要 n*1.5 个自然日（考虑周末和假期）
+    approx_days = int(n * 1.5) + 10
+    start_dt = pd.to_datetime(end_date) - pd.Timedelta(days=approx_days)
     cal = pro.trade_cal(exchange='SSE', start_date=start_dt.strftime('%Y%m%d'), end_date=end_date)
     dates = cal[cal['is_open'] == 1]['cal_date'].tolist()
     return sorted([d for d in dates if d <= end_date], reverse=True)[:n]
@@ -418,15 +427,18 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
 
     # ═══════════════════════════════════════════════════════════
     # v2.7新增：融资三维度（黑马vs蜗牛后验发现的关键差异）
-    # 数据窗口：启动前30日融资数据
+    # v3.4修复：改用"启动日前最近30个交易日"而非45个自然日
+    #   原因：603318真实黑马正天数54.2%（30个交易日内），原窗口45天≈32个交易日会漏算首尾
     # ═══════════════════════════════════════════════════════════
-    margin_before_30d = margin_before_ts[
-        margin_before_ts['trade_date'] >= (
-            pd.to_datetime(launch_date) - pd.Timedelta(days=45)
-        ).strftime('%Y%m%d')
-    ].sort_values('trade_date')
+    # 取启动日之前最近30个交易日
+    launch_dt = pd.to_datetime(launch_date)
+    all_margin_before = margin_before_ts[margin_before_ts['trade_date'] < launch_date].sort_values('trade_date')
+    if len(all_margin_before) >= 30:
+        margin_before_30d = all_margin_before.tail(30).reset_index(drop=True)
+    else:
+        margin_before_30d = all_margin_before.reset_index(drop=True)
 
-    # 维度1：30日融资净买入为正天数占比（黑马>=65%，蜗牛<=61%）
+    # 维度1：30日融资净买入为正天数占比（黑马>=55%，蜗牛偏低）
     margin_pos_days_ratio = 0.0
     if len(margin_before_30d) >= 15:
         # 当日净买入 ≈ rzmre - rzche（融资买入 - 融资偿还）
@@ -457,7 +469,10 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         )
         margin_net_30d = margin_before_30d['daily_net'].sum()
 
-    # 维度4（v2.7修正）：5日净买占30日净买比例（>80%=冲刺型，<50%=均匀建仓）
+    # 维度4（v3.4修正）：5日净买绝对规模 + 5日净买占30日比例
+    # - 均匀建仓型：5日净买 < 5亿（主力慢慢吸）
+    # - 冲刺型：5日净买 > 5亿 且 5D/30D > 80%（短期集中拉升）
+    # - 仅在30日净买>=5亿时，5D/30D比例才有意义（避免小分母导致ratio失真）
     margin_net_5d = 0.0
     if len(pre5_margin) >= 3:
         pre5_margin = pre5_margin.copy()
@@ -466,8 +481,8 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         )
         margin_net_5d = pre5_margin['daily_net'].sum()
     margin_net_5d_ratio = 0.0
-    if margin_net_30d > 0:
-        margin_net_5d_ratio = margin_net_5d / margin_net_30d  # 正数才有意义
+    if margin_net_30d >= 5.0:  # 仅在30日净买>=5亿时看比例
+        margin_net_5d_ratio = margin_net_5d / margin_net_30d
 
     # ── 象限分类（使用启动日前数据）────────────
     # Baux新增：启动前融资持续增长但股价几乎不涨（隐形建仓型）
@@ -645,7 +660,8 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         'margin_pos_days_ratio': margin_pos_days_ratio,   # 维度1：30日净买入正天数占比
         'margin_chg_5d': margin_chg_5d,                  # 维度2：启动前5日融资增幅
         'margin_net_30d': margin_net_30d,                 # 维度3：30日融资净买总额(亿)
-        'margin_net_5d_ratio': margin_net_5d_ratio,      # 维度4：5日净买占30日比例
+        'margin_net_5d': margin_net_5d,             # 维度4a：5日净买绝对值(元)
+        'margin_net_5d_ratio': margin_net_5d_ratio,  # 维度4b：5日净买占30日比例(仅30日>=5亿时有效)
 
         # v2.8新增月线过热维度（v3.0修正：1月20%~25%为缓冲带，不直接排除）
         'is_overheat_excluded': is_overheat_excluded,     # 硬过滤：过热排除（1月>20%且非缓冲带，或2月过热）
@@ -829,11 +845,12 @@ def scan_date(target_date=None, verify_mode=False):
             net30_yi = r['margin_net_30d'] / 1e8  # 转为亿
             net30_pass = "✓" if MARGIN_NET_30D_POSITIVE and r['margin_net_30d'] > 0 else ("N/A" if not MARGIN_NET_30D_POSITIVE else "✗")
             net5d_ratio_pct = r['margin_net_5d_ratio'] * 100
-            net5d_pass = "✓" if r['margin_net_5d_ratio'] < MARGIN_5D_NET_RATIO_THRESH else "✗"
+            net5d_pass = "✓" if abs(r['margin_net_5d']) < MARGIN_5D_NET_ABS_THRESH else "✗"
             print(f"     ⑤ 融资正天数占比: {pos_days_pass} {ratio_pct:.0f}% (阈值>={MARGIN_POS_DAYS_RATIO_THRESH*100:.0f}%)")
             print(f"     ⑥ 启动前5日融资增幅: {chg5d_pass} {r['margin_chg_5d']:+.1f}% (阈值<{MARGIN_CHG_5D_THRESH:.0f}%)")
             print(f"     ⑦ 30日融资净买总额: {net30_yi:+.2f}亿 ({net30_pass})")
-            print(f"     ⑧ 5日净买占30日比例: {net5d_pass} {net5d_ratio_pct:.0f}% (阈值<{MARGIN_5D_NET_RATIO_THRESH*100:.0f}%)")
+            net5d_yi = r['margin_net_5d'] / 1e8  # 转亿
+            print(f"     ⑧ 5日净买绝对规模: {net5d_pass} {net5d_yi:+.2f}亿 (阈值<{MARGIN_5D_NET_ABS_THRESH:.0f}亿)")
 
             # v2.8新增：月线过热维度
             if r['is_overheat_excluded']:
