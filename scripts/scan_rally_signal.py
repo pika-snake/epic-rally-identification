@@ -796,8 +796,9 @@ def scan_date(target_date=None, verify_mode=False):
     df_result = df_result.sort_values('t_day_score', ascending=False)
 
     # ═══════════════════════════════════════════════════════════
-    # 打印汇总表
+    # 打印汇总表（只显示通过v4.0过滤的候选）
     # ═══════════════════════════════════════════════════════════
+    top_for_print = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre8_rise5_abs_days'] < 2)]
     print(f"\n{'='*120}")
     header = (f"{'代码':<12} {'名称':<6} {'T日总分':>6} "
               f"{'背离':>4} {'缩量':>4} {'象限':>4} {'融资信号':>10} "
@@ -805,7 +806,7 @@ def scan_date(target_date=None, verify_mode=False):
     print(header)
     print('-' * 120)
 
-    for _, r in df_result.iterrows():
+    for _, r in top_for_print.iterrows():
         launch_str = r['launch_date'][4:] if r['launch_date'] else "?"
         board_str = f"{int(r['board_count'])}板" if r['board_count'] else "?"
         margin_sig = r.get('margin_signal_desc', 'N/A')
@@ -839,7 +840,7 @@ def scan_date(target_date=None, verify_mode=False):
             verify_candidates.append((r['ts_code'], r['launch_date'], r['quadrant'], int(r['t_day_score'])))
     if not top.empty:
         print(f"\n{'='*70}")
-        print(f"📊 T日买入信号详情（总分>=2，共{len(top)}只）")
+        print(f"📊 T日买入信号详情（总分>=2，共{len(top)}只，通过v4.0过滤）")
         print(f"{'='*70}\n")
         for _, r in top.iterrows():
             board_note = f"，扫到时已是第{int(r['board_count'])}板" if r['board_count'] and r['board_count'] > 1 else ""
