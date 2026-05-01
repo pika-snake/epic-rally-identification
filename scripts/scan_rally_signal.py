@@ -534,7 +534,7 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     elif pre5_chg < -5 and launch_margin_chg is not None and launch_margin_chg > 10:
         quadrant = 'B'
         quadrant_desc = '△ 谨慎买入（启动日融资>10%）'
-    elif margin_long_chg > 25 and pre5_chg < 10 and launch_margin_chg is not None and launch_margin_chg > 3:
+    elif margin_long_chg > 25 and pre5_chg < 10 and launch_margin_chg is not None and launch_margin_chg > 0:
         # Baux：隐形建仓型
         # v2.6修复：移除 pre5_max_day < 5 的硬性排除
         # 原因：启动前借利空挖坑（单日大跌）≠ 纯炒作型异动
@@ -917,7 +917,7 @@ def scan_date(target_date=None, verify_mode=False):
     print(f"\n象限分类（用于描述性分类，不直接加到总分）:")
     print(f"  ★ 象限A：启动前涨幅>5% + 有实质背离 + 无单日异动>=5% → 最优先买入")
     print(f"  △ 象限B：启动前涨幅<-5% + 启动日融资>10% → 谨慎买入")
-    print(f"  ☆ 象限Baux：启动前融资持续增长+25%但股价不涨（总涨幅<10%且无单日异动>=5%）+ 启动日融资>3% → 隐形建仓买入")
+    print(f"  ☆ 象限Baux：启动前融资持续增长+25%但股价不涨（总涨幅<10%且无单日异动>=5%）+ 启动日融资>0% → 隐形建仓买入")
     print(f"  ◇ 象限C：启动前涨幅5~10% + 无实质背离 + 无单日异动 → 小仓位短线")
     print(f"  ○ 象限D：不属于A/B/Baux/C → 坚决不买（含启动前有明显异动）")
     print(f"{'='*70}")
