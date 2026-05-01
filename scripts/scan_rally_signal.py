@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v3.8.1 — T日买入评估 + T+1持有评估
+史诗级行情扫描器 v3.9 — T日买入评估 + T+1持有评估
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -522,12 +522,17 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         pre5_max_day = pre5_with_ret['daily_return'].max()
 
     # ── v3.8新增：启动前10日涨幅≥5%天数过滤 ──────────────────────────
-    # 逻辑：10日内有2天及以上涨幅≥5%，说明有短期活跃资金，不是安静建仓型
+    # 逻辑：启动日之前10个交易日内，有2天及以上涨幅≥5%，说明有短期活跃资金，不是安静建仓型
     # 排除这类股票，避免把短线炒作误判为黑马启动
+    # 重要：启动日本身（涨幅≥7%的涨停日）不纳入统计，"安静建仓"的"安静"指的是启动日之前
     # v3.8.1修复：改用pct_chg列（真实单日涨跌幅），避免close.pct_change()第一行因无前一日数据变成NaN导致漏算
+    # v3.9: 显式排除launch_date本身，确保启动日不计入（防呆保险）
     pre10_rise5_days = 0
     if len(last_10_window) >= 2:
-        pre10_rise5_days = (last_10_window['pct_chg'] >= 5).sum()
+        # last_10_window 已通过 trade_date < launch_date 过滤，启动日不在其中
+        # 再次保险：显式排除 launch_date（防字符串比较万一出问题）
+        window_excl_launch = last_10_window[last_10_window['trade_date'] != launch_date]
+        pre10_rise5_days = (window_excl_launch['pct_chg'] >= 5).sum()
 
     quadrant = None
     quadrant_desc = None
