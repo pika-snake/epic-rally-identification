@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v2.9 — T日买入评估 + T+1持有评估
+史诗级行情扫描器 v3.3 — T日买入评估 + T+1持有评估
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -253,6 +253,8 @@ def find_true_launch_date(ts_code, scan_date, all_calendar):
         prev_pct = price_dict.get(prev_trade_day, None)
 
         # 判断是否是启动日
+        # 条件：当日涨幅>=7% 且 前日涨幅<=5%（前日数据必须存在）
+        # 注意：当前日数据不存在时（prev_pct is None），不能作为启动日，需继续找
         if curr_pct >= 7 and prev_pct is not None and prev_pct <= 5:
             # 找到启动日！计算从启动日到scan_date的连续板数
             board_count = 0
@@ -270,9 +272,31 @@ def find_true_launch_date(ts_code, scan_date, all_calendar):
         # 如果当天是涨停板(>=9.5%)，继续向前找
         if curr_pct >= 9.5:
             continue
-        else:
-            # 当天涨幅在7%~9.5%之间，不是连续板，也没找到启动日
+
+        # 当天涨幅在7%~9.5%之间，或<7%：
+        # 判断是否有有效前日数据
+        if prev_pct is None:
+            # 前日数据缺失（如0420之前有非交易日），继续向前找
+            continue
+        elif curr_pct >= 7 and prev_pct <= 5:
+            # 当天涨幅>=7%且前日<=5%，找到启动日
+            board_count = 0
+            in_range = False
+            for d in sorted(price_dict.keys(), reverse=True):
+                if d == scan_date:
+                    in_range = True
+                if in_range:
+                    if price_dict[d] >= 9.5 and d >= curr_date:
+                        board_count += 1
+                    if d == curr_date:
+                        break
+            return curr_date, board_count
+        elif curr_pct >= 7:
+            # 当天涨幅>=7%但前日>5%，不是启动日，停止搜索
             break
+        else:
+            # 当天涨幅<7%，继续向前找
+            continue
 
     return None, None
 
