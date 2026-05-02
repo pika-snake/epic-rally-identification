@@ -574,7 +574,7 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
 
     # ═══════════════════════════════════════════════════════════
     # v5.0新增：R型（游资快速拉升型）判定
-    # 特征：启动日爆量 + 融资有脉冲 + 股东人数增加
+    # 特征：启动日爆量 + 融资脉冲
     # ═══════════════════════════════════════════════════════════
     # v5.0 R型：游资快速拉升型（独立于黑马总分体系）
     # 条件（需全部满足）：
@@ -584,7 +584,7 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     #      （即游资快速收集筹码的脉冲式入场信号）
     #   3. pre15_rise5_abs_days < 4（避免短线过度炒作）
     #   4. t_day_score >= 1（融资信号至少为普通档）
-    # 注意：v5.0 R型不含股东人数（季度披露，非实时周数据）
+    # 注意：v5.0 R型不含股东人数（季度披露，非实时周数据，无法扫描）
     # ═══════════════════════════════════════════════════════════
     is_r_type = False
     r_type_reason = ''
@@ -693,29 +693,6 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
 
     if net_lg_elg_yi is not None and net_lg_elg_yi <= LAUNCH_DAY_NET_LG_THRESH:
         return None  # 启动日大单净出逃，无条件排除
-
-    # ═══════════════════════════════════════════════════════════
-    # v5.0新增：股东人数变化（游资快速拉升型核心指标）
-    # 逻辑：启动前1~2周股东人数大幅增加 → 游资快速收集筹码，非机构慢建仓
-    # ═══════════════════════════════════════════════════════════
-    holder_chg_pct = None  # 启动前1期vs上1期股东人数变化%
-    holder_recent_date = None
-    holder_prev_date = None
-    try:
-        df_holder = pro.stk_holdernumber(ts_code=ts_code)
-        if not df_holder.empty:
-            df_holder = df_holder.sort_values('end_date', ascending=False).reset_index(drop=True)
-            # 找最近两期
-            dates = df_holder['end_date'].tolist()
-            if len(dates) >= 2:
-                holder_recent_date = str(int(dates[0]))
-                holder_prev_date = str(int(dates[1]))
-                recent_num = df_holder.iloc[0]['holder_num']
-                prev_num = df_holder.iloc[1]['holder_num']
-                if prev_num > 0:
-                    holder_chg_pct = (recent_num - prev_num) / prev_num * 100
-    except Exception:
-        pass
 
     # ═══════════════════════════════════════════════════════════
     # T+1持有评估（使用启动日后数据，包括T+1）
@@ -961,11 +938,10 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
                 margin_sig = f'{chg:+.1f}%普通' if -5 <= chg <= 10 else (f'+{chg:.1f}%强' if chg > 10 else f'{chg:.1f}%否')
             elif margin_sig == 'N/A':
                 margin_sig = '无数据'
-            holder_str = f"{r['holder_chg_pct']:+.1f}%" if r['holder_chg_pct'] is not None else 'N/A'
             print(f"{r['ts_code']:<12} {r['name']:<6} {int(r['t_day_score']):>6}  "
                   f"{margin_sig:>10} "
                   f"{launch_str:>8} {board_str:>4}  "
-                  f"💨R型 股东↑{holder_str} {r.get('r_type_reason','')}")
+                  f"💨R型 {r.get('r_type_reason','')}")
 
     # ═══════════════════════════════════════════════════════════
     # 高分详情
@@ -1075,11 +1051,9 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
             print(f"  {'─'*50}")
             print(f"  💨 R型游资快速拉升（与机构安静建仓型不同）")
             print(f"  🎯 核心特征:")
-            holder_str = f"{r['holder_chg_pct']:+.1f}%" if r['holder_chg_pct'] is not None else 'N/A'
             print(f"     ① 启动日量比: {r['vol_ratio_tday']:.2f} (阈值>1.5)")
-            print(f"     ② 股东人数变化: {holder_str} (阈值>0%，增加=游资入场)")
-            print(f"     ③ 融资脉冲: pre15内有{int(r['margin_pulse_days'])}天单日融资变化>=5%")
-            print(f"     ④ 15日异动天数: {int(r['pre15_rise5_abs_days'])}天 (阈值<4天)")
+            print(f"     ② 融资脉冲: pre20内有{int(r['margin_pulse_days'])}天rzche/rzye>=10%")
+            print(f"     ③ 15日异动天数: {int(r['pre15_rise5_abs_days'])}天 (阈值<4天)")
             print(f"  象限: {r['quadrant']} {r['quadrant_desc']}")
 
             margin_sig = r.get('margin_signal_desc', 'N/A')
@@ -1111,8 +1085,8 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
     print(f"  ◇ 象限C：启动前涨幅5~10% + 无实质背离 + 无单日异动 → 小仓位短线")
     print(f"  ○ 象限D：不属于A/B/Baux/C → 坚决不买（含启动前有明显异动）")
     print(f"\nR型游资快速拉升（v5.0新增，独立于象限体系）:")
-    print(f"  💨 特征：启动日爆量 + 融资脉冲 + 股东人数增加")
-    print(f"  条件：量比>1.5 + pre15融资脉冲>=1次 + 股东人数增加 + 15日异动<4天 + 融资信号>=1分")
+    print(f"  💨 特征：启动日爆量 + 融资脉冲")
+    print(f"  条件：量比>1.5 + pre20融资脉冲>=2天(rzche/rzye>=10%) + 15日异动<4天 + 融资信号>=1分")
     print(f"  与机构建仓型区别：建仓期短、启动快、融资撤退快")
     print(f"{'='*70}")
 
