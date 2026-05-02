@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v5.0 — T日买入评估 + T+1持有评估 + R型游资快速拉升识别
+史诗级行情扫描器 v5.2 — T日买入评估 + T+1持有评估 + R型游资快速拉升识别
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -206,6 +206,7 @@ def load_all_margin_data(trade_dates):
         return pd.DataFrame()
     margin_df = pd.concat(all_margin, ignore_index=True)
     margin_df['rzye_yi'] = margin_df['rzye'] / 1e8
+    margin_df['rzche_yi'] = margin_df['rzche'] / 1e8
     return margin_df
 
 
@@ -578,7 +579,7 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     # ═══════════════════════════════════════════════════════════
     # v5.0 R型：游资快速拉升型（独立于黑马总分体系）
     # 条件（需全部满足）：
-    #   1. 启动日量比 > 1.5（游资大量入场，不是缩量拉升）
+    #   1. 启动日量比 > 1.2（游资大量入场，不是缩量拉升）
     #   2. 启动前20日内有至少2次融资脉冲
     #      融资脉冲定义：单日rzche净买入额占当日融资余额>=10%
     #      （即游资快速收集筹码的脉冲式入场信号）
@@ -598,13 +599,12 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
             margin_window['rzche_ratio'] = margin_window['rzche_yi'] / margin_window['rzye_yi'] * 100
             margin_pulse_days = (margin_window['rzche_ratio'].abs() >= 10).sum()
 
-        if (vol_ratio_tday > 1.5 and
+        if (vol_ratio_tday > 1.2 and
             margin_pulse_days >= 2 and
             pre15_rise5_abs_days < 4 and
-            t_day_score >= 1):
+            launch_margin_chg >= 1):
             is_r_type = True
-            r_type_reason = (f'量比{v:.1f}>1.5｜融资脉冲{m}次｜15日异动{d}天<4天'
-                             .format(v=vol_ratio_tday, m=margin_pulse_days, d=pre15_rise5_abs_days))
+            r_type_reason = (f'量比{vol_ratio_tday:.2f}>1.2｜融资脉冲{margin_pulse_days}次｜15日异动{pre15_rise5_abs_days}天<4天')
 
     quadrant = None
     quadrant_desc = None
@@ -1051,7 +1051,7 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
             print(f"  {'─'*50}")
             print(f"  💨 R型游资快速拉升（与机构安静建仓型不同）")
             print(f"  🎯 核心特征:")
-            print(f"     ① 启动日量比: {r['vol_ratio_tday']:.2f} (阈值>1.5)")
+            print(f"     ① 启动日量比: {r['vol_ratio_tday']:.2f} (阈值>1.2)")
             print(f"     ② 融资脉冲: pre20内有{int(r['margin_pulse_days'])}天rzche/rzye>=10%")
             print(f"     ③ 15日异动天数: {int(r['pre15_rise5_abs_days'])}天 (阈值<4天)")
             print(f"  象限: {r['quadrant']} {r['quadrant_desc']}")
@@ -1086,7 +1086,7 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
     print(f"  ○ 象限D：不属于A/B/Baux/C → 坚决不买（含启动前有明显异动）")
     print(f"\nR型游资快速拉升（v5.0新增，独立于象限体系）:")
     print(f"  💨 特征：启动日爆量 + 融资脉冲")
-    print(f"  条件：量比>1.5 + pre20融资脉冲>=2天(rzche/rzye>=10%) + 15日异动<4天 + 融资信号>=1分")
+    print(f"  条件：量比>1.2 + pre20融资脉冲>=2天(rzche/rzye>=10%) + 15日异动<4天 + 融资信号>=1分")
     print(f"  与机构建仓型区别：建仓期短、启动快、融资撤退快")
     print(f"{'='*70}")
 
