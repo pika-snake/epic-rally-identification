@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v4.0 — T日买入评估 + T+1持有评估
+史诗级行情扫描器 v4.1 — T日买入评估 + T+1持有评估
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -11,7 +11,7 @@
     不带参数默认上一个交易日
     -v/--verify: 验证模式，对Baux/B/A象限候选股输出月线+融资结构+启动后走势汇总
 
-T日买入评估（0~4分 + 融资四维度 + 月线过热过滤 + v4.0涨跌过滤）：
+T日买入评估（0~4分 + 融资四维度 + 月线过热过滤 + v4.1涨跌过滤）：
   ① 背离验证（1分）：启动前股价跌/融资余额增，持续>=5天
      v2.1修复：改用"启动前最后10日窗口"，避免中间大幅波动切断背离判断
   ② 量比验证（1分）：T日量比 < 前5日均量（缩量上涨）
@@ -28,7 +28,7 @@ T日买入评估（0~4分 + 融资四维度 + 月线过热过滤 + v4.0涨跌过
      - 启动前1月涨幅 >20% → 短期过热，排除
      - 启动前2月涨幅 >60%/80%（月线多头时放宽到80%）
      - 黑马特征：月线上升通道 OR 历史低位启动，稳健不过热
-  ⓘ v4.0：启动前8日涨跌绝对值>=5%天数>=2 → 排除（短期炒作型）
+  ⓘ v4.1：启动前15日涨跌绝对值>=5%天数>=4 → 排除（短期炒作型）
      逻辑：8日内2天及以上涨跌超5%说明有短线活跃资金，不符合安静建仓型
   ⑩ 大单资金过滤（v3.6新增，硬过滤）：
      - 启动日大单+超大单净量 <=0亿 → 无条件排除（主力出逃）
@@ -500,18 +500,18 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     else:
         margin_long_chg = 0.0
 
-    # ── v4.0：启动前8日涨幅绝对值>=5%天数过滤 ─────────────────────────
-    # 逻辑：启动日之前8个交易日内，涨幅绝对值>=5%的天数>=2天 → 排除
+    # ── v4.1：启动前15日涨跌绝对值>=5%天数过滤 ─────────────────────────
+    # 逻辑：启动日之前15个交易日内，涨跌绝对值>=5%的天数>=4天 → 排除
     # 排除这类股票，避免把短线炒作误判为黑马启动
     # 重要：启动日本身（涨幅>=7%的涨停日）不纳入统计，"安静建仓"的"安静"指的是启动日之前
-    # v3.8/v3.9: 原用10日窗口+仅看涨幅>=5%；v4.0: 缩小到8日+绝对值（包含下跌日）
-    DIV_WINDOW = 8
+    # v3.8/v3.9: 原用10日窗口+仅看涨幅>=5%；v4.0: 缩小到8日+绝对值；v4.1: 扩大到15日+>=4天
+    DIV_WINDOW = 15
     price_before_launch = price_df[price_df['trade_date'] < launch_date].copy()
     price_before_launch = price_before_launch.sort_values('trade_date').reset_index(drop=True)
-    last_8_window = price_before_launch.tail(DIV_WINDOW)
+    last_15_window = price_before_launch.tail(DIV_WINDOW)
 
     # 启动前5日涨幅（启动日之前最近5个交易日）
-    pre5 = last_8_window.tail(5)
+    pre5 = last_15_window.tail(5)
     pre5_chg = 0.0
     if len(pre5) >= 3:
         pre5_chg = (pre5['close'].iloc[-1] / pre5['close'].iloc[0] - 1) * 100
@@ -523,13 +523,13 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         pre5_with_ret['daily_return'] = pre5_with_ret['close'].pct_change() * 100
         pre5_max_day = pre5_with_ret['daily_return'].max()
 
-    # ── v4.0：启动前8日涨幅绝对值>=5%天数过滤 ─────────────────────────
-    pre8_rise5_abs_days = 0
-    if len(last_8_window) >= 2:
-        # last_8_window 已通过 trade_date < launch_date 过滤，启动日不在其中
+    # ── v4.1：启动前15日涨跌绝对值>=5%天数过滤 ─────────────────────────
+    pre15_rise5_abs_days = 0
+    if len(last_15_window) >= 2:
+        # last_15_window 已通过 trade_date < launch_date 过滤，启动日不在其中
         # 显式排除 launch_date（防呆保险）
-        window_excl_launch = last_8_window[last_8_window['trade_date'] != launch_date]
-        pre8_rise5_abs_days = (window_excl_launch['pct_chg'].abs() >= 5).sum()
+        window_excl_launch = last_15_window[last_15_window['trade_date'] != launch_date]
+        pre15_rise5_abs_days = (window_excl_launch['pct_chg'].abs() >= 5).sum()
 
     quadrant = None
     quadrant_desc = None
@@ -684,7 +684,7 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         'quadrant_desc': quadrant_desc,
         'pre5_chg': pre5_chg,
         'pre5_max_day': pre5_max_day,
-        'pre8_rise5_abs_days': pre8_rise5_abs_days,
+        'pre15_rise5_abs_days': pre15_rise5_abs_days,
         'margin_long_chg': margin_long_chg,
         'margin_signal': margin_signal,
         'launch_margin_chg': launch_margin_chg,
@@ -718,8 +718,10 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     }
 
 
-def scan_date(target_date=None, verify_mode=False):
-    """扫描指定日期的涨幅>=7%股票"""
+def scan_date(target_date=None, verify_mode=False, codes_filter=None):
+    """扫描指定日期的涨幅>=7%股票
+       codes_filter: list of ts_codes to limit scan (for batch processing)
+    """
     if target_date is None:
         cal = pro.trade_cal(exchange='SSE', start_date='20260420', end_date='20260430')
         cal = cal[cal['is_open'] == 1]['cal_date'].tolist()
@@ -729,6 +731,8 @@ def scan_date(target_date=None, verify_mode=False):
 
     print(f"\n{'='*70}")
     print(f"📅 扫描日期: {target_date}  |  涨幅门槛: >={MIN_RISE_PCT}%")
+    if codes_filter:
+        print(f"📦 批量模式: {len(codes_filter)}只")
     print(f"🎯 评估类型: T日买入评估（启动日当天决策）")
     print(f"{'='*70}\n")
 
@@ -736,6 +740,9 @@ def scan_date(target_date=None, verify_mode=False):
     df_today = pro.daily(trade_date=target_date)
     rise7 = df_today[df_today['pct_chg'] >= MIN_RISE_PCT].copy()
     rise7 = rise7.sort_values('pct_chg', ascending=False)
+
+    if codes_filter:
+        rise7 = rise7[rise7['ts_code'].isin(codes_filter)]
 
     if rise7.empty:
         print("今日无涨幅>=7%的股票")
@@ -796,9 +803,9 @@ def scan_date(target_date=None, verify_mode=False):
     df_result = df_result.sort_values('t_day_score', ascending=False)
 
     # ═══════════════════════════════════════════════════════════
-    # 打印汇总表（只显示通过v4.0过滤的候选）
+    # 打印汇总表（只显示通过v4.1过滤的候选）
     # ═══════════════════════════════════════════════════════════
-    top_for_print = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre8_rise5_abs_days'] < 2)]
+    top_for_print = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre15_rise5_abs_days'] < 4)]
     print(f"\n{'='*120}")
     header = (f"{'代码':<12} {'名称':<6} {'T日总分':>6} "
               f"{'背离':>4} {'缩量':>4} {'象限':>4} {'融资信号':>10} "
@@ -832,7 +839,7 @@ def scan_date(target_date=None, verify_mode=False):
     # ═══════════════════════════════════════════════════════════
     # 高分详情
     # ═══════════════════════════════════════════════════════════
-    top = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre8_rise5_abs_days'] < 2)]
+    top = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre15_rise5_abs_days'] < 4)]
     # v2.9: 收集Baux/B/A候选用于验证模式
     verify_candidates = []
     for _, r in top.iterrows():
@@ -840,7 +847,7 @@ def scan_date(target_date=None, verify_mode=False):
             verify_candidates.append((r['ts_code'], r['launch_date'], r['quadrant'], int(r['t_day_score'])))
     if not top.empty:
         print(f"\n{'='*70}")
-        print(f"📊 T日买入信号详情（总分>=2，共{len(top)}只，通过v4.0过滤）")
+        print(f"📊 T日买入信号详情（总分>=2，共{len(top)}只，通过v4.1过滤）")
         print(f"{'='*70}\n")
         for _, r in top.iterrows():
             board_note = f"，扫到时已是第{int(r['board_count'])}板" if r['board_count'] and r['board_count'] > 1 else ""
@@ -861,9 +868,9 @@ def scan_date(target_date=None, verify_mode=False):
             print(f"     ③ 象限分类: {r['quadrant']} {r['quadrant_desc']} "
                   f"(启动前5日涨幅={r['pre5_chg']:+.1f}%)")
 
-            # v4.0：启动前8日涨幅绝对值>=5%天数过滤
-            print(f"     ⓘ v4.0过滤: 8日涨跌绝对值≥5%天数={int(r['pre8_rise5_abs_days'])}天"
-                  f"{' ✗排除' if r['pre8_rise5_abs_days'] >= 2 else ' ✓通过'}")
+            # v4.1：启动前15日涨跌绝对值>=5%天数过滤
+            print(f"     ⓘ v4.1过滤: 15日涨跌绝对值≥5%天数={int(r['pre15_rise5_abs_days'])}天"
+                  f" {' ✗排除' if r['pre15_rise5_abs_days'] >= 4 else ' ✓通过'}")
 
             margin_sig = r.get('margin_signal_desc', 'N/A')
             if margin_sig == 'N/A' and r['launch_margin_chg'] is not None:
@@ -1130,6 +1137,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='史诗级行情扫描器 v3.0')
     parser.add_argument('date', nargs='?', default=None, help='扫描日期 YYYYMMDD格式，默认上一交易日')
     parser.add_argument('-v', '--verify', action='store_true', help='验证模式：对Baux/B/A象限股输出月线+融资结构+启动后走势')
+    parser.add_argument('--codes', type=str, default=None, help='逗号分隔的股票代码列表，用于批量扫描')
     args = parser.parse_args()
 
-    scan_date(args.date, verify_mode=args.verify)
+    codes_filter = None
+    if args.codes:
+        codes_filter = args.codes.split(',')
+
+    scan_date(args.date, verify_mode=args.verify, codes_filter=codes_filter)
