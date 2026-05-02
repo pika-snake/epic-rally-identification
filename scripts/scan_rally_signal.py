@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v4.1 — T日买入评估 + T+1持有评估
+史诗级行情扫描器 v4.2 — T日买入评估 + T+1持有评估
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -11,7 +11,7 @@
     不带参数默认上一个交易日
     -v/--verify: 验证模式，对Baux/B/A象限候选股输出月线+融资结构+启动后走势汇总
 
-T日买入评估（0~4分 + 融资四维度 + 月线过热过滤 + v4.1涨跌过滤）：
+T日买入评估（0~4分 + 融资四维度 + 月线过热过滤 + v4.2涨跌过滤）：
   ① 背离验证（1分）：启动前股价跌/融资余额增，持续>=5天
      v2.1修复：改用"启动前最后10日窗口"，避免中间大幅波动切断背离判断
   ② 量比验证（1分）：T日量比 < 前5日均量（缩量上涨）
@@ -222,6 +222,38 @@ def get_price_data(ts_code, trade_dates):
     return df
 
 
+def _is_launch_date_pre8_clean(ts_code, candidate_date, all_calendar_sorted):
+    """
+    检查候选启动日的前8日涨跌是否干净（>=5%的天数<2天）。
+    如果不干净（>=2天），返回False，让调用方继续往前找。
+    这是"安静建仓"的必要条件——如果启动日之前已有频繁异动，说明不是真正的黑马建仓起点。
+    """
+    # 向前取8个交易日（不包括candidate_date当天）
+    cand_idx = None
+    for i, d in enumerate(all_calendar_sorted):
+        if d == candidate_date:
+            cand_idx = i
+            break
+    if cand_idx is None or cand_idx < 9:
+        return True  # 数据不够，不阻止
+
+    # 取candidate_date之前的8个交易日
+    pre8_dates = all_calendar_sorted[cand_idx - 8:cand_idx]
+    if len(pre8_dates) < 8:
+        return True
+
+    # 查这8天的pct_chg
+    date_strs = [str(d) for d in pre8_dates]
+    df = pro.daily(ts_code=ts_code, start_date=date_strs[0], end_date=date_strs[-1],
+                   fields='trade_date,pct_chg')
+    if df.empty:
+        return True
+
+    df_dict = {row['trade_date']: row['pct_chg'] for _, row in df.iterrows()}
+    dirty_days = sum(1 for d in date_strs if d in df_dict and abs(float(df_dict[d])) >= 5)
+    return dirty_days < 2
+
+
 def find_true_launch_date(ts_code, scan_date, all_calendar):
     """
     找到真正的启动日（连续涨停序列的第一板）
@@ -272,7 +304,11 @@ def find_true_launch_date(ts_code, scan_date, all_calendar):
         # 条件：当日涨幅>=7% 且 前日涨幅<=5%（前日数据必须存在）
         # 注意：当前日数据不存在时（prev_pct is None），不能作为启动日，需继续找
         if curr_pct >= 7 and prev_pct is not None and prev_pct <= 5:
-            # 找到启动日！计算从启动日到scan_date的连续板数
+            # 找到启动日！先验证pre8是否干净（v4.2新增）
+            if not _is_launch_date_pre8_clean(ts_code, curr_date, all_calendar_sorted):
+                # pre8不干净，继续往前找更早的启动日
+                continue
+            # pre8干净，确认是启动日
             board_count = 0
             in_range = False
             for d in sorted(price_dict.keys(), reverse=True):
@@ -295,7 +331,11 @@ def find_true_launch_date(ts_code, scan_date, all_calendar):
             # 前日数据缺失（如0420之前有非交易日），继续向前找
             continue
         elif curr_pct >= 7 and prev_pct <= 5:
-            # 当天涨幅>=7%且前日<=5%，找到启动日
+            # 当天涨幅>=7%且前日<=5%，找到启动日，先验证pre8是否干净（v4.2新增）
+            if not _is_launch_date_pre8_clean(ts_code, curr_date, all_calendar_sorted):
+                # pre8不干净，继续往前找更早的启动日
+                continue
+            # pre8干净，确认是启动日
             board_count = 0
             in_range = False
             for d in sorted(price_dict.keys(), reverse=True):
@@ -803,7 +843,7 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None):
     df_result = df_result.sort_values('t_day_score', ascending=False)
 
     # ═══════════════════════════════════════════════════════════
-    # 打印汇总表（只显示通过v4.1过滤的候选）
+    # 打印汇总表（只显示通过v4.2过滤的候选）
     # ═══════════════════════════════════════════════════════════
     top_for_print = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre15_rise5_abs_days'] < 4)]
     print(f"\n{'='*120}")
@@ -847,7 +887,7 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None):
             verify_candidates.append((r['ts_code'], r['launch_date'], r['quadrant'], int(r['t_day_score'])))
     if not top.empty:
         print(f"\n{'='*70}")
-        print(f"📊 T日买入信号详情（总分>=2，共{len(top)}只，通过v4.1过滤）")
+        print(f"📊 T日买入信号详情（总分>=2，共{len(top)}只，通过v4.2过滤）")
         print(f"{'='*70}\n")
         for _, r in top.iterrows():
             board_note = f"，扫到时已是第{int(r['board_count'])}板" if r['board_count'] and r['board_count'] > 1 else ""
