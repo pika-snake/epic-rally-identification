@@ -7,9 +7,10 @@
 - T+1持有评估：使用 T+1及之后 数据（买入后用来判断要不要持有）
 
 用法:
-    python scan_rally_signal.py [日期YYYYMMDD] [-v|--verify]
+    python scan_rally_signal.py [日期YYYYMMDD] [-v|--verify] [-t 6|7] [--codes 600000.SH,...]
     不带参数默认上一个交易日
     -v/--verify: 验证模式，对Baux/B/A象限候选股输出月线+融资结构+启动后走势汇总
+    -t/--threshold: 涨停门槛，6.0或7.0，默认7.0
 
 T日买入评估（0~4分 + 融资四维度 + 月线过热过滤 + v4.2涨跌过滤）：
   ① 背离验证（1分）：启动前股价跌/融资余额增，持续>=5天
@@ -758,9 +759,10 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     }
 
 
-def scan_date(target_date=None, verify_mode=False, codes_filter=None):
-    """扫描指定日期的涨幅>=7%股票
+def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_pct=7.0):
+    """扫描指定日期的涨幅>=门槛%股票
        codes_filter: list of ts_codes to limit scan (for batch processing)
+       min_rise_pct: 涨幅门槛，默认7.0
     """
     if target_date is None:
         cal = pro.trade_cal(exchange='SSE', start_date='20260420', end_date='20260430')
@@ -770,28 +772,28 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None):
         target_date = str(target_date)
 
     print(f"\n{'='*70}")
-    print(f"📅 扫描日期: {target_date}  |  涨幅门槛: >={MIN_RISE_PCT}%")
+    print(f"📅 扫描日期: {target_date}  |  涨幅门槛: >={min_rise_pct}%")
     if codes_filter:
         print(f"📦 批量模式: {len(codes_filter)}只")
     print(f"🎯 评估类型: T日买入评估（启动日当天决策）")
     print(f"{'='*70}\n")
 
-    # Step 1: 涨幅>=7%的股票
+    # Step 1: 涨幅>=门槛%的股票
     df_today = pro.daily(trade_date=target_date)
-    rise7 = df_today[df_today['pct_chg'] >= MIN_RISE_PCT].copy()
-    rise7 = rise7.sort_values('pct_chg', ascending=False)
+    riseN = df_today[df_today['pct_chg'] >= min_rise_pct].copy()
+    riseN = riseN.sort_values('pct_chg', ascending=False)
 
     if codes_filter:
-        rise7 = rise7[rise7['ts_code'].isin(codes_filter)]
+        riseN = riseN[riseN['ts_code'].isin(codes_filter)]
 
-    if rise7.empty:
-        print("今日无涨幅>=7%的股票")
+    if riseN.empty:
+        print(f"今日无涨幅>={min_rise_pct}%的股票")
         return
 
-    print(f"涨幅>=7% 股票数: {len(rise7)}\n")
+    print(f"涨幅>={min_rise_pct}% 股票数: {len(riseN)}\n")
     print(f"{'代码':<12} {'涨幅%':>8} {'扫到日期':>10}")
     print('-' * 35)
-    for _, row in rise7.head(15).iterrows():
+    for _, row in riseN.head(15).iterrows():
         print(f"{row['ts_code']:<12} {row['pct_chg']:>8.2f} {target_date:>10}")
 
     # Step 2: 历史交易日
@@ -813,12 +815,12 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None):
     print(f"{'='*70}\n")
 
     results = []
-    for idx, (_, stock) in enumerate(rise7.iterrows()):
+    for idx, (_, stock) in enumerate(riseN.iterrows()):
         ts_code = stock['ts_code']
         name = stock.get('name', ts_code)
 
-        if (idx + 1) % 20 == 0 or idx == len(rise7) - 1:
-            print(f"  已处理 {idx+1}/{len(rise7)} 只股票...")
+        if (idx + 1) % 20 == 0 or idx == len(riseN) - 1:
+            print(f"  已处理 {idx+1}/{len(riseN)} 只股票...")
 
         try:
             price_df = get_price_data(ts_code, trade_dates_desc)
@@ -1178,10 +1180,13 @@ if __name__ == '__main__':
     parser.add_argument('date', nargs='?', default=None, help='扫描日期 YYYYMMDD格式，默认上一交易日')
     parser.add_argument('-v', '--verify', action='store_true', help='验证模式：对Baux/B/A象限股输出月线+融资结构+启动后走势')
     parser.add_argument('--codes', type=str, default=None, help='逗号分隔的股票代码列表，用于批量扫描')
+    parser.add_argument('-t', '--threshold', type=float, default=7.0,
+                        choices=[6.0, 7.0],
+                        help='涨停门槛（6.0或7.0），默认7.0')
     args = parser.parse_args()
 
     codes_filter = None
     if args.codes:
         codes_filter = args.codes.split(',')
 
-    scan_date(args.date, verify_mode=args.verify, codes_filter=codes_filter)
+    scan_date(args.date, verify_mode=args.verify, codes_filter=codes_filter, min_rise_pct=args.threshold)
