@@ -572,36 +572,36 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     # ═══════════════════════════════════════════════════════════
     # v5.0新增：R型（游资快速拉升型）判定
     # 特征：启动日爆量 + 融资有脉冲 + 股东人数增加
-    # 核心逻辑：不同于"机构安静建仓"，游资打法是快速收集筹码后快速拉升
-    # R型可弥补框架对"游资型黑马"的遗漏
+    # ═══════════════════════════════════════════════════════════
+    # v5.0 R型：游资快速拉升型（独立于黑马总分体系）
     # 条件（需全部满足）：
     #   1. 启动日量比 > 1.5（游资大量入场，不是缩量拉升）
-    #   2. 启动前15日内有至少1次融资单日增幅 >= 5%（融资脉冲 = 游资快速入场信号）
-    #   3. 股东人数最近一期较上期增加（>0% = 筹码从集中走向分散 = 游资收集）
-    #   4. pre15_rise5_abs_days < 4（避免短线过度炒作，排除4天以上的活跃股）
-    #   5. t_day_score >= 1（融资信号至少为普通档，避免无序爆拉）
+    #   2. 启动前20日内有至少2次融资脉冲
+    #      融资脉冲定义：单日rzche净买入额占当日融资余额>=10%
+    #      （即游资快速收集筹码的脉冲式入场信号）
+    #   3. pre15_rise5_abs_days < 4（避免短线过度炒作）
+    #   4. t_day_score >= 1（融资信号至少为普通档）
+    # 注意：v5.0 R型不含股东人数（季度披露，非实时周数据）
     # ═══════════════════════════════════════════════════════════
     is_r_type = False
     r_type_reason = ''
-    margin_pulse_days = 0  # pre15内融资单日增幅>=5%的天数
+    margin_pulse_days = 0  # pre20内融资脉冲天数
 
-    if vol_ratio_tday is not None and holder_chg_pct is not None:
-        # 计算pre15内融资单日增幅>=5%的天数
-        margin_window = margin_before_ts.sort_values('trade_date').tail(15)
+    if vol_ratio_tday is not None:
+        # 计算pre20内融资脉冲天数（rzche/rzye >= 10% 视为一次脉冲）
+        margin_window = margin_before_ts.sort_values('trade_date').tail(20)
         if len(margin_window) >= 3:
             margin_window = margin_window.copy()
-            margin_window['rzye_chg_pct'] = margin_window['rzye_yi'].pct_change() * 100
-            margin_pulse_days = (margin_window['rzye_chg_pct'].abs() >= 5).sum()
+            margin_window['rzche_ratio'] = margin_window['rzche_yi'] / margin_window['rzye_yi'] * 100
+            margin_pulse_days = (margin_window['rzche_ratio'].abs() >= 10).sum()
 
         if (vol_ratio_tday > 1.5 and
-            margin_pulse_days >= 1 and
-            holder_chg_pct > 0 and
+            margin_pulse_days >= 2 and
             pre15_rise5_abs_days < 4 and
             t_day_score >= 1):
             is_r_type = True
-            r_type_reason = (f'量比{v:.1f}>1.5｜融资脉冲{m}次｜股东增{holder_chg_pct:.1f}%｜'
-                             f'15日异动{pre15_rise5_abs_days}天<4天'
-                             .format(v=vol_ratio_tday, m=margin_pulse_days))
+            r_type_reason = (f'量比{v:.1f}>1.5｜融资脉冲{m}次｜15日异动{d}天<4天'
+                             .format(v=vol_ratio_tday, m=margin_pulse_days, d=pre15_rise5_abs_days))
 
     quadrant = None
     quadrant_desc = None
@@ -814,7 +814,6 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         # v5.0新增：R型（游资快速拉升型）
         'is_r_type': is_r_type,
         'r_type_reason': r_type_reason,
-        'holder_chg_pct': holder_chg_pct,
         'margin_pulse_days': margin_pulse_days,
     }
 
