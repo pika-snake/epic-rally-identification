@@ -218,6 +218,9 @@ def get_price_data(ts_code, trade_dates):
     if df.empty:
         return pd.DataFrame()
     df = df.sort_values('trade_date').reset_index(drop=True)
+    # vol_ma5: 标准前5日算法
+    # rolling(5).mean().shift(1) 在 T 日 = mean(vol[T-1]~vol[T-5])
+    # vol_ratio = vol[T] / vol_ma5[T] = T日成交量 / 前5日成交量均值
     df['vol_ma5'] = df['vol'].rolling(5).mean().shift(1)
     df['vol_ratio'] = df['vol'] / df['vol_ma5']
     return df
