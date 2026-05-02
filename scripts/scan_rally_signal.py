@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v5.3 — T日买入评估 + T+1持有评估 + R型游资快速拉升识别
+史诗级行情扫描器 v5.5 — T日买入评估 + T+1持有评估 + R型游资快速拉升识别（v5.5：黑马排除R型）
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -901,9 +901,14 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
     # ═══════════════════════════════════════════════════════════
     # 打印汇总表
     # v5.0新增：R型（游资快速拉升型）与A/B/Baux并列输出
-    # 过滤条件：A/B/Baux/C需t_day_score>=2；R型需is_r_type=True
+    # 过滤条件（v5.5）：黑马总分>=2 + 非R型（R型只在下方独立表格展示）
     # ═══════════════════════════════════════════════════════════
-    top_for_print = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre15_rise5_abs_days'] < 4)]
+    top_for_print = df_result[
+        (df_result['t_day_score'] >= 2) &
+        (~df_result['is_overheat_excluded']) &
+        (df_result['pre15_rise5_abs_days'] < 4) &
+        (df_result['is_r_type'] == False)   # v5.5：排除R型，只保留纯黑马
+    ]
     r_type_candidates = df_result[(df_result['is_r_type'] == True)]
 
     print(f"\n{'='*120}")
