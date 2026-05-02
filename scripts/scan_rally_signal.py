@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v5.2 — T日买入评估 + T+1持有评估 + R型游资快速拉升识别
+史诗级行情扫描器 v5.3 — T日买入评估 + T+1持有评估 + R型游资快速拉升识别
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -434,19 +434,34 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     vol_ratio_tday = None
     vol_ma5_before = None
     has_volume_shrink = False
+    prev_day_pct_chg = None  # 前一天涨跌幅（用于判断温和放量场景）
 
     scan_row = price_df[price_df['trade_date'] == scan_date]
     if not scan_row.empty:
         vol_ratio_tday = scan_row['vol_ratio'].iloc[0]
+
+        # 获取前一天涨跌幅
+        prev_day_rows = price_df[price_df['trade_date'] < scan_date]
+        if len(prev_day_rows) >= 1:
+            prev_day = prev_day_rows.sort_values('trade_date').tail(1)
+            prev_day_pct_chg = prev_day['pct_chg'].iloc[0]
+
         # 前5日均量（不含T日）
         vol_ma5_before = price_df[
             (price_df['trade_date'] < scan_date) &
             (price_df['trade_date'] >= launch_date)
         ]['vol_ratio'].mean() if len(price_df[price_df['trade_date'] < scan_date]) >= 5 else None
 
-        # T日上涨且量比低于前期均值 → 缩量上涨
+        # 两种有效量价信号（满足任一即得1分）：
+        # ① 经典缩量上涨：T日上涨 but 量比 < 前期均值×90%（机构锁仓）
+        # ② 温和放量：前一天下跌 + T日上涨 + 量比 < 1.5（下跌无量+启动日温和放量 = 健康主力行为）
+        # 注意：①②互斥，不同时满足
+        cond_shrink = cond_healthy = False
         if vol_ratio_tday is not None and vol_ma5_before is not None and vol_ma5_before > 0:
-            has_volume_shrink = (pct_chg > 0) and (vol_ratio_tday < vol_ma5_before * 0.9)  # 量比低于前期均值90%
+            cond_shrink = (pct_chg > 0) and (vol_ratio_tday < vol_ma5_before * 0.9)
+        if vol_ratio_tday is not None and prev_day_pct_chg is not None:
+            cond_healthy = (prev_day_pct_chg < 0 and pct_chg > 0 and vol_ratio_tday < 1.5)
+        has_volume_shrink = cond_shrink or cond_healthy
 
     # ── ④ 启动日融资变化（最强单信号，使用启动日当天数据）────────────
     # 获取启动日融资余额 vs 前一交易日
@@ -975,7 +990,8 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
 
             vol_r = f"{r['vol_ratio_tday']:.2f}" if r['vol_ratio_tday'] else "N/A"
             vol_m = f"{r['vol_ma5_before']:.2f}" if r['vol_ma5_before'] else "N/A"
-            print(f"     ② 量比验证: {'✓' if r['has_volume_shrink'] else '✗'} "
+            cond = "缩量上涨" if r['has_volume_shrink'] else "✗不满足"
+            print(f"     ② 量比验证: {cond} "
                   f"(T日量比={vol_r} vs 前期均值={vol_m})")
 
             print(f"     ③ 象限分类: {r['quadrant']} {r['quadrant_desc']} "
@@ -1073,6 +1089,7 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
     print(f"  ① 背离验证（1分）：启动前最后10日窗口内股价跌/融资余额增，持续>=3天")
     print(f"     v2.1修复：改用启动前最后10日窗口，避免中间大幅波动切断判断")
     print(f"  ② 量比验证（1分）：T日上涨但量比 < 前期均量（缩量上涨）")
+    print(f"     新增：前一天跌+T日涨+量比<1.5也有效（温和放量=健康主力行为）")
     print(f"  ③ 启动日融资变化（0~2分）：>+10%强烈买入，<-5%否决")
     print(f"\nT+1持有评估（买入后使用，不用于买入决策）:")
     print(f"  ① 融资持续：启动日后连续3天融资余额增加")
