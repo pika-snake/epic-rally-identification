@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v4.2 — T日买入评估 + T+1持有评估
+史诗级行情扫描器 v4.3 — T日买入评估 + T+1持有评估
 
 核心设计原则：
 - T日买入决策：只使用 T-1及之前 + T日当天 数据
@@ -255,15 +255,15 @@ def _is_launch_date_pre8_clean(ts_code, candidate_date, all_calendar_sorted):
     return dirty_days < 2
 
 
-def find_true_launch_date(ts_code, scan_date, all_calendar):
+def find_true_launch_date(ts_code, scan_date, all_calendar, min_rise_pct=7.0):
     """
     找到真正的启动日（连续涨停序列的第一板）
 
     规则：
         1. 从scan_date向前，逐个检查是否是涨停板(>=9.5%)
         2. 如果是涨停板，继续向前找
-        3. 直到找到"前一天涨幅<=5% 且 当天涨幅>=7%"的日子 → 这就是启动日
-        4. 如果当天>=7%但<9.5%，也找到了（可能是反弹启动，不是连续板）
+        3. 直到找到"前一天涨幅<=5% 且 当天涨幅>=min_rise_pct"的日子 → 这就是启动日
+        4. 如果当天>=min_rise_pct但<9.5%，也找到了（可能是反弹启动，不是连续板）
 
     返回: (启动日字符串, 第几板int) 或 (None, None)
     """
@@ -302,9 +302,9 @@ def find_true_launch_date(ts_code, scan_date, all_calendar):
         prev_pct = price_dict.get(prev_trade_day, None)
 
         # 判断是否是启动日
-        # 条件：当日涨幅>=7% 且 前日涨幅<=5%（前日数据必须存在）
+        # 条件：当日涨幅>=min_rise_pct 且 前日涨幅<=5%（前日数据必须存在）
         # 注意：当前日数据不存在时（prev_pct is None），不能作为启动日，需继续找
-        if curr_pct >= 7 and prev_pct is not None and prev_pct <= 5:
+        if curr_pct >= min_rise_pct and prev_pct is not None and prev_pct <= 5:
             # 找到启动日！先验证pre8是否干净（v4.2新增）
             if not _is_launch_date_pre8_clean(ts_code, curr_date, all_calendar_sorted):
                 # pre8不干净，继续往前找更早的启动日
@@ -331,7 +331,7 @@ def find_true_launch_date(ts_code, scan_date, all_calendar):
         if prev_pct is None:
             # 前日数据缺失（如0420之前有非交易日），继续向前找
             continue
-        elif curr_pct >= 7 and prev_pct <= 5:
+        elif curr_pct >= min_rise_pct and prev_pct <= 5:
             # 当天涨幅>=7%且前日<=5%，找到启动日，先验证pre8是否干净（v4.2新增）
             if not _is_launch_date_pre8_clean(ts_code, curr_date, all_calendar_sorted):
                 # pre8不干净，继续往前找更早的启动日
@@ -348,17 +348,17 @@ def find_true_launch_date(ts_code, scan_date, all_calendar):
                     if d == curr_date:
                         break
             return curr_date, board_count
-        elif curr_pct >= 7:
-            # 当天涨幅>=7%但前日>5%，不是启动日，停止搜索
+        elif curr_pct >= min_rise_pct:
+            # 当天涨幅>=min_rise_pct但前日>5%，不是启动日，停止搜索
             break
         else:
-            # 当天涨幅<7%，继续向前找
+            # 当天涨幅<min_rise_pct，继续向前找
             continue
 
     return None, None
 
 
-def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df, price_df):
+def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df, price_df, min_rise_pct=7.0):
     """
     v2.0: T日买入评估 + T+1持有评估
 
@@ -374,16 +374,18 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
       ③ 连续涨停
     """
     # ── 找到真正的启动日 ──
-    launch_date, board_count = find_true_launch_date(ts_code, scan_date, all_calendar)
+    launch_date, board_count = find_true_launch_date(ts_code, scan_date, all_calendar, min_rise_pct)
     if launch_date is None:
         return None
 
     # ── 启动日涨幅 ──
     launch_pct = None
     for _, row in price_df.iterrows():
-        if row['trade_date'] == launch_date:
+        if str(row['trade_date']) == str(launch_date):
             launch_pct = row['pct_chg']
             break
+    if launch_pct is None:
+        return None
 
     # ═══════════════════════════════════════════════════════════
     # T日买入评估
@@ -829,7 +831,7 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
 
             result = analyze_stock_v2(
                 ts_code, name, stock['pct_chg'],
-                target_date, all_calendar, margin_df, price_df
+                target_date, all_calendar, margin_df, price_df, min_rise_pct
             )
             if result is not None:
                 results.append(result)
