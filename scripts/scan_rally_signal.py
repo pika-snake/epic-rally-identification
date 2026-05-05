@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v5.5 — T日买入评估 + T+1持有评估 + R型游资快速拉升识别（v5.5：黑马排除R型）
+史诗级行情扫描器 v6.14 — T日买入评估 + T+1持有评估 + Y型游资炒作识别
+|（v6.14：Y型新增①启动前5日单日最大涨幅≤5%过滤（封堵分段计算漏洞）②融资持续性pass（启动日rzche比不超过前5日均值2倍）③Y总分≥35门槛）
+｜（v6.13：Y型月线MA5上升条件——所有Y型必须满足月线沿着MA5上升，即price_above_ma5=True）
+｜（v6.12：黑马路月线MA5上升条件——所有黑马必须满足月线沿着MA5上升，即price_above_ma5=True）
+（v6.10：Y型条件1改为量比[2~3]——启动日量比>=2且<=3，>3直接排除）
+（v6.9：Y型新增第8条件——启动前15日涨跌幅绝对值>7%天数>=2直接排除）
+（v6.5：新增"急跌+缩量横盘"形态检测，Y型评分加入急跌挖坑Bonus）
+（v6.4：Y型综合强度分公式；v6.0：新增Y型游资炒作型；黑马排除Y型）
 
 核心设计原则：
-- T日买入决策：只使用 T-1及之前 + T日当天 数据
-- T+1持有评估：使用 T+1及之后 数据（买入后用来判断要不要持有）
+|- T日买入决策：只使用 T-1及之前 + T日当天 数据
+|- T+1持有评估：使用 T+1及之后 数据（买入后用来判断要不要持有）
 
 用法:
     python scan_rally_signal.py [日期YYYYMMDD] [-v|--verify] [-t 6|7] [--codes 600000.SH,...]
@@ -224,6 +231,9 @@ def get_price_data(ts_code, trade_dates):
     # vol_ratio = vol[T] / vol_ma5[T] = T日成交量 / 前5日成交量均值
     df['vol_ma5'] = df['vol'].rolling(5).mean().shift(1)
     df['vol_ratio'] = df['vol'] / df['vol_ma5']
+    # vol_ma10: 前10日算法（Y型量比专用）
+    df['vol_ma10'] = df['vol'].rolling(10).mean().shift(1)
+    df['vol_ratio_10d'] = df['vol'] / df['vol_ma10']
     return df
 
 
@@ -432,6 +442,7 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     # ── ② 量比验证（使用T日当天数据）────────────
     # T日量比 vs 前5日均量（判断是否缩量上涨）
     vol_ratio_tday = None
+    vol_ratio_10d_tday = None
     vol_ma5_before = None
     has_volume_shrink = False
     prev_day_pct_chg = None  # 前一天涨跌幅（用于判断温和放量场景）
@@ -439,6 +450,7 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     scan_row = price_df[price_df['trade_date'] == scan_date]
     if not scan_row.empty:
         vol_ratio_tday = scan_row['vol_ratio'].iloc[0]
+        vol_ratio_10d_tday = scan_row['vol_ratio_10d'].iloc[0]
 
         # 获取前一天涨跌幅
         prev_day_rows = price_df[price_df['trade_date'] < scan_date]
@@ -576,6 +588,11 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
     if len(pre5) >= 3:
         pre5_chg = (pre5['close'].iloc[-1] / pre5['close'].iloc[0] - 1) * 100
 
+    # 启动前15日总涨跌幅（用于Y型过滤：涨跌幅<=-3%直接排除）
+    pre15_chg = 0.0
+    if len(last_15_window) >= 3:
+        pre15_chg = (last_15_window['close'].iloc[-1] / last_15_window['close'].iloc[0] - 1) * 100
+
     # 启动前5日最大单日涨幅（用于Baux排除有明显异动的股票）
     pre5_max_day = 0.0
     if len(pre5) >= 2:
@@ -583,43 +600,89 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         pre5_with_ret['daily_return'] = pre5_with_ret['close'].pct_change() * 100
         pre5_max_day = pre5_with_ret['daily_return'].max()
 
+    # v6.14新增：启动前5日单日最大涨幅（用于Y型条件⑨——封堵分段计算漏洞）
+    # 原理：pre5_chg是区间总涨幅，分段计算可能隐藏单日暴涨（如1212涨+10.1%在1217前5日内）
+    # Y型要求：单日最大涨幅<=5%，超过则排除（已有明显异动）
+    pre5_single_day_max = 0.0
+    if len(pre5) >= 2:
+        pre5_ret = pre5.copy()
+        pre5_ret['daily_return'] = pre5_ret['close'].pct_change() * 100
+        pre5_single_day_max = pre5_ret['daily_return'].max()
+
     pre15_rise5_abs_days = 0
     if len(last_15_window) >= 2:
         window_excl_launch = last_15_window[last_15_window['trade_date'] != launch_date]
         pre15_rise5_abs_days = (window_excl_launch['pct_chg'].abs() >= 5).sum()
 
+    # v6.9新增：启动前15日涨跌幅绝对值>7%的天数（用于Y型过滤：>=2天直接排除）
+    pre15_rise7_abs_days = 0
+    if len(last_15_window) >= 2:
+        window_excl_launch = last_15_window[last_15_window['trade_date'] != launch_date]
+        pre15_rise7_abs_days = (window_excl_launch['pct_chg'].abs() > 7).sum()
+
+    # v6.15新增：启动前15日K线实体统计（涨跌幅实体 = |收盘-开盘|/开盘）
+    # 原理：启动日前K线实体越小（多日小涨小跌），说明游资在悄悄建仓、不惊动市场
+    #       实体越大（长红长绿），说明有资金提前异动，不符合安静建仓逻辑
+    # 指标1：pre15_body_small_abs_days = 实体涨幅<2%的天数（越多越好）
+    # 指标2：pre15_body_big_abs_days = 实体涨幅>=5%的天数（>=3天直接排除）
+    pre15_body_small_abs_days = 0
+    pre15_body_big_abs_days = 0
+    if len(last_15_window) >= 2 and 'open' in last_15_window.columns and 'close' in last_15_window.columns:
+        window_excl = last_15_window[last_15_window['trade_date'] != launch_date].copy()
+        if len(window_excl) > 0:
+            window_excl['body_pct'] = (window_excl['close'] - window_excl['open']).abs() / window_excl['open'] * 100
+            pre15_body_small_abs_days = (window_excl['body_pct'] < 2.0).sum()
+            pre15_body_big_abs_days = (window_excl['body_pct'] >= 5.0).sum()
+
+    # ── v6.5 形态检测：启动前"急跌+缩量横盘"结构 ─────────────────────────
+    # 形态定义：启动前15日内有 >=1次急跌（单日跌幅>=5%）+ 随后横盘缩量
+    # 典型案例：301217.SZ（0323急跌-7.8% + 0403~0406缩量横盘 + 0410启动）
+    #          002033.SZ（0323急跌-9.7% + 0324~0414缩量横盘 + 0415启动）
+    # 注意：急跌可能发生在启动日前16~20日，所以用20日窗口（大于v4.1的15日）
+    # 形态本质：游资"吓出散户后快速拉升"——在启动日前通过急跌洗盘
+    #           后续横盘期极度缩量说明游资在悄悄吸筹而非出货
+    CRASH_WINDOW = 20  # 用更大的窗口捕捉启动前更早的急跌
+    last_crash_window = price_before_launch.tail(CRASH_WINDOW)
+    pre15_crash_days = last_crash_window[last_crash_window['pct_chg'] <= -5.0]
+    has_pre_crash = len(pre15_crash_days) >= 1
+
+    # 横盘缩量验证：急跌后5日内成交量比急跌日缩量>=30%（游资在吸筹而非出逃）
+    has_lateral_shrink = False
+    if has_pre_crash:
+        crash_row = pre15_crash_days.sort_values('trade_date').iloc[-1]
+        crash_date = crash_row['trade_date']
+        crash_vol = float(crash_row['vol'])
+        # 在last_crash_window中定位crash_date的位置（用窗口内的相对索引）
+        crash_window_indices = [i for i in last_crash_window.index
+                               if last_crash_window.loc[i, 'trade_date'] == crash_date]
+        if crash_window_indices:
+            crash_local_idx = crash_window_indices[0]
+            # 用iloc定位crash在窗口中的相对位置
+            crash_rel_pos = list(last_crash_window.index).index(crash_local_idx)
+            all_indices = list(last_crash_window.index)
+            post_indices = all_indices[crash_rel_pos:crash_rel_pos + 5]
+            post_crash = last_crash_window.loc[post_indices]
+            if len(post_crash) >= 2:
+                avg_post_vol = float(post_crash['vol'].mean())
+                if crash_vol > 0 and avg_post_vol <= crash_vol * 0.70:
+                    has_lateral_shrink = True
+
+    has_crash_dig = has_pre_crash and has_lateral_shrink
+
     # ═══════════════════════════════════════════════════════════
-    # v5.0新增：R型（游资快速拉升型）判定
-    # 特征：启动日爆量 + 融资脉冲
+    # v6.0 Y型（游资炒作型）
+    # 计算逻辑：pre5d_rzche_ratio_mean + launch_day_rzche_ratio
     # ═══════════════════════════════════════════════════════════
-    # v5.0 R型：游资快速拉升型（独立于黑马总分体系）
-    # 条件（需全部满足）：
-    #   1. 启动日量比 > 1.2（游资大量入场，不是缩量拉升）
-    #   2. 启动前20日内有至少2次融资脉冲
-    #      融资脉冲定义：单日rzche净买入额占当日融资余额>=10%
-    #      （即游资快速收集筹码的脉冲式入场信号）
-    #   3. pre15_rise5_abs_days < 4（避免短线过度炒作）
-    #   4. t_day_score >= 1（融资信号至少为普通档）
-    # 注意：v5.0 R型不含股东人数（季度披露，非实时周数据，无法扫描）
-    # ═══════════════════════════════════════════════════════════
+    is_y_type = False
+    y_type_reason = ''
+    pre5d_rzche_ratio_mean = 0.0
+    launch_day_rzche_ratio = 0.0
+    margin_sustainability_pass = False  # 默认值，避免UnboundLocalError（if块外使用前必须初始化）
+
+    # v5.0新增：R型已放弃（风险太高），保留变量但不使用
     is_r_type = False
     r_type_reason = ''
-    margin_pulse_days = 0  # pre20内融资脉冲天数
-
-    if vol_ratio_tday is not None:
-        # 计算pre20内融资脉冲天数（rzche/rzye >= 10% 视为一次脉冲）
-        margin_window = margin_before_ts.sort_values('trade_date').tail(20)
-        if len(margin_window) >= 3:
-            margin_window = margin_window.copy()
-            margin_window['rzche_ratio'] = margin_window['rzche_yi'] / margin_window['rzye_yi'] * 100
-            margin_pulse_days = (margin_window['rzche_ratio'].abs() >= 10).sum()
-
-        if (vol_ratio_tday > 1.2 and
-            margin_pulse_days >= 2 and
-            pre15_rise5_abs_days < 4 and
-            launch_margin_chg >= 1):
-            is_r_type = True
-            r_type_reason = (f'量比{vol_ratio_tday:.2f}>1.2｜融资脉冲{margin_pulse_days}次｜15日异动{pre15_rise5_abs_days}天<4天')
+    margin_pulse_days = 0
 
     quadrant = None
     quadrant_desc = None
@@ -692,6 +755,79 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
 
     # v3.0过热硬过滤：1月过热(>20%)时，仅在非缓冲带(非20%~25%)才排除；2月过热必排除
     is_overheat_excluded = (overheat_1m and not is_warm) or overheat_2m
+
+    # ═══════════════════════════════════════════════════════════
+    # v6.0 Y型（游资炒作型）判定
+    # 核心思想：启动日前5个交易日融资大量涌入 + 启动日融资继续大量涌入
+    # 指标：rzche/rzye（融资占余额比）= 当日新增融资/融资余额，衡量融资强度
+    # ═══════════════════════════════════════════════════════════
+    margin_before_sorted = margin_before_ts.sort_values('trade_date')
+    pre5 = margin_before_sorted.tail(5)
+    if len(pre5) >= 3 and vol_ratio_tday is not None:
+        # 条件1：前5日rzche/rzye均值 > 5%（启动前持续吸钱）
+        valid = pre5[pre5['rzye_yi'] > 0].copy()
+        valid['rzche_ratio'] = valid['rzche_yi'] / valid['rzye_yi']
+        launch_day_rzche_ratio = 0.0  # 默认值，避免UnboundLocalError
+        pre5d_rzche_ratio_mean = 0.0   # 默认值，避免UnboundLocalError（前面只在len>=3时初始化）
+        valid = valid.dropna(subset=['rzche_ratio'])
+        if len(valid) >= 3:
+            pre5d_rzche_ratio_mean = valid['rzche_ratio'].mean() * 100
+
+        # 条件2：启动日rzche/rzye > 15%（启动日爆发）
+        launch_margin_row = margin_df[
+            (margin_df['ts_code'] == ts_code) &
+            (margin_df['trade_date'] == launch_date)
+        ]
+        if not launch_margin_row.empty:
+            rzche_val = launch_margin_row['rzche_yi'].iloc[0]
+            rzye_val = launch_margin_row['rzye_yi'].iloc[0]
+            if rzye_val > 0:
+                launch_day_rzche_ratio = rzche_val / rzye_val * 100
+
+        # v6.14新增：融资持续性验证
+        # 条件⑩：启动日rzche比不超过前5日均值的2倍（避免"一日游"游资——启动日爆量后快速撤退）
+        # 原理：若启动日融资是前5日均值的2倍以上，说明游资在启动日集中对倒，并非持续建仓
+        #       真正的慢牛蓄力：启动日融资应该有迹可循，不是一次性冲高
+        #       案例：图南股份300855——启动日28%是前5日均值13.7%的2.04倍，推荐后快速亏损
+        margin_sustainability_pass = False
+        if pre5d_rzche_ratio_mean > 0 and launch_day_rzche_ratio > 0:
+            ratio_check = launch_day_rzche_ratio / pre5d_rzche_ratio_mean
+            margin_sustainability_pass = (ratio_check <= 2.0)
+
+        # Y型条件（需全部满足，共11条）：
+        #  1. vol_ratio_10d_tday >= 2.0（启动日前10交易日量比>=2，排除温和放量和游资控盘不活跃的票）
+        #  2. vol_ratio_10d_tday <= 3.0（v6.10新增：量比>3直接排除——巨量异动不符合Y型安静建仓逻辑）
+        #  3. pre5d_rzche_ratio_mean > 5%（启动前5日融资强度均值 elevated）
+        #  4. launch_day_rzche_ratio > 15%（启动日当天融资活跃度异常跳升）
+        #  5. pre15_rise5_abs_days < 5（避免极端炒作，<5即通过，与v4.1的>=5排除标准对齐）
+        #  6. pre5_chg <= 5%（v6.8升级：启动前5日涨跌>5%直接排除——涨太多说明已有明显异动或主力提前拉升）
+        #  7. -3% < pre15_chg <= 10%（启动前15日总涨跌幅：<-3%排除，>10%也排除——涨太多说明已有明显异动）
+        #  8. pre15_rise7_abs_days < 2（v6.9新增：启动前15日涨跌幅绝对值>7%天数>=2直接排除——波动过大不符合Y型）
+        #  9. pre5_single_day_max <= 5.0（v6.14新增：启动前5日单日最大涨幅≤5%——封堵分段计算漏洞）
+        # 10. margin_sustainability_pass（v6.14新增：启动日rzche比不超过前5日均值2倍——避免一日游游资）
+        # 11. pre15_body_big_abs_days < 3（v6.15新增：启动前15日K线实体>=5%天数<3——实体大天数越多说明异动越明显）
+        #  注：Y型不检查is_overheat_excluded——游资专炒已在动的股票，月线过热是Y型的结果而非排除条件
+        if (vol_ratio_10d_tday is not None and vol_ratio_10d_tday >= 2.0 and
+            vol_ratio_10d_tday <= 3.0 and
+            pre5d_rzche_ratio_mean > 5.0 and
+            launch_day_rzche_ratio > 15.0 and
+            pre15_rise5_abs_days < 5 and
+            pre5_chg <= 5.0 and
+            pre15_chg > -3.0 and pre15_chg <= 10.0 and
+            pre15_rise7_abs_days < 2 and
+            pre5_single_day_max <= 5.0 and
+            margin_sustainability_pass and
+            pre15_body_big_abs_days < 3):
+            is_y_type = True
+            y_type_reason = (f'量比10日{vol_ratio_10d_tday:.2f}[2~3]｜前5日rzche/rzye均={pre5d_rzche_ratio_mean:.1f}%｜'
+                            f'启动日rzche/rzye={launch_day_rzche_ratio:.1f}%｜'
+                            f'15日异动{pre15_rise5_abs_days}天<5天｜'
+                            f'前5日涨跌{pre5_chg:+.1f}%<=5%｜'
+                            f'15日涨跌{pre15_chg:+.1f}%(-3%~10%)｜'
+                            f'15日巨幅波动{pre15_rise7_abs_days}天<2天｜'
+                            f'前5日单日最大{pre5_single_day_max:+.1f}%<=5%｜'
+                            f'融资蓄力比{launch_day_rzche_ratio/pre5d_rzche_ratio_mean:.1f}x<=2x｜'
+                            f'K线实体大天数{pre15_body_big_abs_days}<3')
 
     # v3.6新增：启动日大单资金过滤（无条件排除：启动日大单净量<=0）
     net_lg_elg_yi = None  # 大单+超大单净量(亿)
@@ -769,12 +905,18 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         'margin_chg': margin_chg,
         'has_volume_shrink': has_volume_shrink,
         'vol_ratio_tday': vol_ratio_tday,
+        'vol_ratio_10d_tday': vol_ratio_10d_tday,
         'vol_ma5_before': vol_ma5_before,
         'quadrant': quadrant,
         'quadrant_desc': quadrant_desc,
         'pre5_chg': pre5_chg,
+        'pre15_chg': pre15_chg,
         'pre5_max_day': pre5_max_day,
+        'pre5_single_day_max': pre5_single_day_max,  # v6.14新增：Y型条件⑨
         'pre15_rise5_abs_days': pre15_rise5_abs_days,
+        'pre15_rise7_abs_days': pre15_rise7_abs_days,
+        'pre15_body_small_abs_days': pre15_body_small_abs_days,  # v6.15新增：K线实体<2%天数
+        'pre15_body_big_abs_days': pre15_body_big_abs_days,     # v6.15新增：K线实体>=5%天数
         'margin_long_chg': margin_long_chg,
         'margin_signal': margin_signal,
         'launch_margin_chg': launch_margin_chg,
@@ -810,6 +952,17 @@ def analyze_stock_v2(ts_code, name, pct_chg, scan_date, all_calendar, margin_df,
         'is_r_type': is_r_type,
         'r_type_reason': r_type_reason,
         'margin_pulse_days': margin_pulse_days,
+
+        # v6.0新增：Y型（游资炒作型）
+        'is_y_type': is_y_type,
+        'y_type_reason': y_type_reason,
+        'pre5d_rzche_ratio_mean': pre5d_rzche_ratio_mean,
+        'launch_day_rzche_ratio': launch_day_rzche_ratio,
+        'margin_sustainability_pass': margin_sustainability_pass,  # v6.14新增：融资持续性
+
+        # v6.5新增：形态特征
+        'has_crash_dig': has_crash_dig,
+        'pre5_chg': pre5_chg,
     }
 
 
@@ -836,6 +989,8 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
     df_today = pro.daily(trade_date=target_date)
     riseN = df_today[df_today['pct_chg'] >= min_rise_pct].copy()
     riseN = riseN.sort_values('pct_chg', ascending=False)
+    # v6.1：跳过北交所股票（不投资北交所）
+    riseN = riseN[~riseN['ts_code'].str.endswith('.BJ')]
 
     if codes_filter:
         riseN = riseN[riseN['ts_code'].isin(codes_filter)]
@@ -887,7 +1042,12 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
             )
             if result is not None:
                 results.append(result)
-        except Exception:
+            else:
+                print(f"\n  ⚠️ {ts_code} 返回None（启动日未找到或被过滤）")
+        except Exception as e:
+            import traceback
+            print(f"\n  ⚠️ {ts_code} 分析异常: {e}")
+            traceback.print_exc()
             continue
 
     if not results:
@@ -900,16 +1060,17 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
 
     # ═══════════════════════════════════════════════════════════
     # 打印汇总表
-    # v5.0新增：R型（游资快速拉升型）与A/B/Baux并列输出
-    # 过滤条件（v5.5）：黑马总分>=2 + 非R型（R型只在下方独立表格展示）
-    # ═══════════════════════════════════════════════════════════
+    #  v5.5/6.0 分类体系：
+    #   黑马（机构安静建仓型）：总分>=2 + 非Y型
+    #   Y型（游资炒作型）：vol_ratio>1.5 + 前5日rzche比均值>5% + 启动日rzche比>15%
+    #   黑马（机构安静建仓型）：总分>=2 + 非Y型 + 月线MA5上升(price_above_ma5=True, v6.12新增)
     top_for_print = df_result[
         (df_result['t_day_score'] >= 2) &
         (~df_result['is_overheat_excluded']) &
         (df_result['pre15_rise5_abs_days'] < 4) &
-        (df_result['is_r_type'] == False)   # v5.5：排除R型，只保留纯黑马
+        (df_result['is_y_type'] == False) &  # 黑马排除Y型（只留安静建仓型）
+        (df_result['price_above_ma5'] == True)   # v6.12新增：月线MA5上升
     ]
-    r_type_candidates = df_result[(df_result['is_r_type'] == True)]
 
     print(f"\n{'='*120}")
     header = (f"{'代码':<12} {'名称':<6} {'T日总分':>6} "
@@ -941,36 +1102,95 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
               f"{launch_str:>8} {board_str:>4}  "
               f"{r['quadrant_desc']}")
 
-    # v5.0 R型汇总表
-    if not r_type_candidates.empty:
-        print(f"\n{'='*120}")
-        r_header = (f"{'代码':<12} {'名称':<6} {'T日总分':>6} "
-                    f"{'融资信号':>10} {'启动日':>8} {'板数':>4}  "
-                    f"{'R型游资快速拉升特征'}")
-        print(r_header)
-        print('-' * 120)
-        for _, r in r_type_candidates.iterrows():
-            launch_str = r['launch_date'][4:] if r['launch_date'] else "?"
-            board_str = f"{int(r['board_count'])}板" if r['board_count'] else "?"
-            margin_sig = r.get('margin_signal_desc', 'N/A')
-            if margin_sig == 'N/A' and r['launch_margin_chg'] is not None:
-                chg = r['launch_margin_chg']
-                margin_sig = f'{chg:+.1f}%普通' if -5 <= chg <= 10 else (f'+{chg:.1f}%强' if chg > 10 else f'{chg:.1f}%否')
-            elif margin_sig == 'N/A':
-                margin_sig = '无数据'
-            print(f"{r['ts_code']:<12} {r['name']:<6} {int(r['t_day_score']):>6}  "
-                  f"{margin_sig:>10} "
-                  f"{launch_str:>8} {board_str:>4}  "
-                  f"💨R型 {r.get('r_type_reason','')}")
+    # v6.5: Y型综合强度分
+    # 核心：启动日rzche涌入力度(权重最高) + 量比(游资参与度)
+    def calc_y_strength(row):
+        launch = row['launch_day_rzche_ratio']
+        vol = row['vol_ratio_10d_tday'] if pd.notna(row['vol_ratio_10d_tday']) else 1.0
+        pre5d = row['pre5d_rzche_ratio_mean']
+        margin_chg_5d = row.get('margin_chg_5d', 0.0)
+        pre5_chg = row['pre5_chg']
+        base = launch * 0.5 + vol * 2.0 + pre5d * 0.2 + margin_chg_5d * 0.3
+        # 安静Bonus：启动前越安静、涨幅越低，游资吸筹越隐蔽
+        if pre5_chg < -1.5:
+            quiet_bonus = 4.5   # 深度安静：持续小幅下跌后启动，最隐蔽
+        elif pre5_chg < 0:
+            quiet_bonus = 3.5
+        elif abs(pre5_chg) < 1:
+            quiet_bonus = 2.5
+        elif pre5_chg < 5:
+            quiet_bonus = 1.5
+        else:
+            quiet_bonus = 0.0
+        # 慢建仓Bonus：pre5d 5~12%区间代表游资"漫长低调"地悄悄吸筹
+        if 5.0 <= pre5d < 10.0:
+            slow_bonus = 4.0    # 极慢极隐蔽
+        elif 10.0 <= pre5d <= 12.0:
+            slow_bonus = 3.0    # 慢建仓
+        else:
+            slow_bonus = 0.0
+        # v6.5急跌挖坑Bonus：有"急跌+缩量横盘"结构说明游资洗盘彻底，拉升更有力
+        crash_bonus = 6.0 if row.get('has_crash_dig', False) else 0.0
+        # v6.15新增小实体天数Bonus：启动前15日K线实体越小（<2%的天数越多），游资建仓越安静，拉升越有劲
+        small_body_days = row.get('pre15_body_small_abs_days', 0)
+        if small_body_days >= 10:
+            body_quiet_bonus = 6.0   # 极度安静：10天以上小实体，完美蓄力形态
+        elif small_body_days >= 8:
+            body_quiet_bonus = 4.5
+        elif small_body_days >= 6:
+            body_quiet_bonus = 3.0
+        elif small_body_days >= 4:
+            body_quiet_bonus = 1.5
+        else:
+            body_quiet_bonus = 0.0
+        return base + quiet_bonus + slow_bonus + crash_bonus + body_quiet_bonus
+
+    # v6.14: 先在df_result上算好y_strength_score（y_top过滤需要）
+    df_result['y_strength_score'] = df_result.apply(calc_y_strength, axis=1)
+
+    y_type_candidates = df_result[
+        (df_result['is_y_type'] == True) &
+        (df_result['price_above_ma5'] == True)   # v6.13新增：月线MA5上升（Y型也必须满足）
+    ]
+
+    y_type_candidates['y_strength_score'] = y_type_candidates.apply(calc_y_strength, axis=1)
+    # v6.14新增：Y总分≥35门槛（表内过滤，避免低分Y型混入）
+    y_type_candidates = y_type_candidates[y_type_candidates['y_strength_score'] >= 35.0]
+    y_type_candidates = y_type_candidates.sort_values(
+        'y_strength_score', ascending=False
+    ).reset_index(drop=True)
+
+    print(f"\n{'='*180}")
+    y_header = (f"{'#':>3} {'代码':<12} {'名称':<6} {'T日总分':>6} {'Y强度分':>8} "
+                f"{'量比(10日)[2~3]':>14} {'前5日rzche比':>12} {'启动日rzche比':>12} "
+                f"{'前5日涨跌':>8} {'15日涨跌':>8} {'15日>7%天':>9} {'前5日单日最大':>11} {'融资蓄力比':>10} {'小实体<2%':>10} {'大实体>=5%':>10} {'板数':>4}  {'急跌挖坑'}")
+    print(y_header)
+    print('-' * 220)
+    for idx, (_, r) in enumerate(y_type_candidates.iterrows(), 1):
+        board_str = f"{int(r['board_count'])}板" if r['board_count'] else "?"
+        pre5d_ratio = r.get('pre5d_rzche_ratio_mean', 0.0)
+        rzche_ratio = r.get('launch_day_rzche_ratio', 0.0)
+        vol_r = r.get('vol_ratio_10d_tday', 0.0)
+        pre5_chg = r.get('pre5_chg', 0.0)
+        pre15_chg = r.get('pre15_chg', 0.0)
+        pre15_rise7_days = r.get('pre15_rise7_abs_days', 0)
+        pre5_sdm = r.get('pre5_single_day_max', 0.0)
+        msp = r.get('margin_sustainability_pass', False)
+        rzche_ratio_check = (rzche_ratio / pre5d_ratio) if pre5d_ratio > 0 else 0.0
+        crash_tag = "🔨急跌挖坑" if r.get('has_crash_dig', False) else ""
+        msp_tag = "✓融资蓄力" if msp else "✗融资一日游"
+        print(f"{idx:>3}. {r['ts_code']:<12} {r['name']:<6} {int(r['t_day_score']):>6} {r['y_strength_score']:>8.1f} "
+              f"{vol_r:>9.2f} {pre5d_ratio:>11.1f}% {rzche_ratio:>11.1f}% "
+              f"{pre5_chg:>7.1f}% {pre15_chg:>7.1f}% {pre15_rise7_days:>9} {pre5_sdm:>10.1f}% {rzche_ratio_check:>9.1f}x "
+              f"{r.get('pre15_body_small_abs_days', 0):>10} {r.get('pre15_body_big_abs_days', 0):>10} {board_str:>4}  {crash_tag} {msp_tag}")
 
     # ═══════════════════════════════════════════════════════════
     # 高分详情
     # ═══════════════════════════════════════════════════════════
-    # v5.0: 收集R型候选用于详情输出
-    # 高分候选（已有筛选逻辑）
-    top = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre15_rise5_abs_days'] < 4)]
-    # R型候选（独立于t_day_score筛选）
-    r_top = df_result[df_result['is_r_type'] == True]
+    # 高分候选（黑马：安静建仓型，v6.12新增月线MA5上升条件）
+    top = df_result[(df_result['t_day_score'] >= 2) & (~df_result['is_overheat_excluded']) & (df_result['pre15_rise5_abs_days'] < 4) & (df_result['is_y_type'] == False) & (df_result['price_above_ma5'] == True) & (df_result['pre15_body_big_abs_days'] < 3)]
+    # Y型候选（游资炒作型，v6.14新增Y总分≥35门槛）
+    y_top = df_result[(df_result['is_y_type'] == True) & (df_result['y_strength_score'] >= 35.0)]
 
     # v2.9: 收集Baux/B/A候选用于验证模式
     verify_candidates = []
@@ -1060,31 +1280,7 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
                 print(f"     → 象限D，不建议买入")
             print()
 
-    # v5.0: R型详情
-    if not r_top.empty:
-        print(f"\n{'='*70}")
-        print(f"💨 R型游资快速拉升详情（共{len(r_top)}只）")
-        print(f"{'='*70}\n")
-        for _, r in r_top.iterrows():
-            board_note = f"，扫到时已是第{int(r['board_count'])}板" if r['board_count'] and r['board_count'] > 1 else ""
-
-            print(f"[{r['ts_code']}] {r['name']}  扫到日期: {r['scan_date']}  T日总分: {int(r['t_day_score'])}")
-            print(f"  {'─'*50}")
-            print(f"  💨 R型游资快速拉升（与机构安静建仓型不同）")
-            print(f"  🎯 核心特征:")
-            print(f"     ① 启动日量比: {r['vol_ratio_tday']:.2f} (阈值>1.2)")
-            print(f"     ② 融资脉冲: pre20内有{int(r['margin_pulse_days'])}天rzche/rzye>=10%")
-            print(f"     ③ 15日异动天数: {int(r['pre15_rise5_abs_days'])}天 (阈值<4天)")
-            print(f"  象限: {r['quadrant']} {r['quadrant_desc']}")
-
-            margin_sig = r.get('margin_signal_desc', 'N/A')
-            if margin_sig == 'N/A' and r['launch_margin_chg'] is not None:
-                chg = r['launch_margin_chg']
-                margin_sig = f'{chg:+.1f}%' if -5 <= chg <= 10 else (f'+{chg:.1f}%强烈' if chg > 10 else f'{chg:.1f}%否决')
-            print(f"  启动日融资: {margin_sig}")
-            print(f"  ✅ 结论: {r['name']} 启动日{r['launch_date']}（{r['launch_pct']:.1f}%{board_note}）")
-            print(f"     → 💨 R型游资快速拉升（{r.get('r_type_reason','')}）")
-            print()
+    # R型已放弃，不输出详情
 
     # ═══════════════════════════════════════════════════════════
     # 信号规则说明
@@ -1106,10 +1302,10 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
     print(f"  ☆ 象限Baux：启动前融资持续增长+25%但股价不涨（总涨幅<10%且无单日异动>=5%）+ 启动日融资>0% → 隐形建仓买入")
     print(f"  ◇ 象限C：启动前涨幅5~10% + 无实质背离 + 无单日异动 → 小仓位短线")
     print(f"  ○ 象限D：不属于A/B/Baux/C → 坚决不买（含启动前有明显异动）")
-    print(f"\nR型游资快速拉升（v5.0新增，独立于象限体系）:")
-    print(f"  💨 特征：启动日爆量 + 融资脉冲")
-    print(f"  条件：量比>1.2 + pre20融资脉冲>=2天(rzche/rzye>=10%) + 15日异动<4天 + 融资信号>=1分")
-    print(f"  与机构建仓型区别：建仓期短、启动快、融资撤退快")
+    print(f"\nY型游资炒作型（v6.0新增，独立于象限体系）:")
+    print(f"  🌊 特征：启动日前5个交易日融资大量涌入 + 启动日融资继续大量涌入")
+    print(f"  条件：量比>1.5 + 前5日rzche/rzye均值>5% + 启动日rzche/rzye>15% + 15日异动<5天")
+    print(f"  与黑马体系区别：黑马追求安静建仓，Y型专抓游资热炒加速段")
     print(f"{'='*70}")
 
     # v2.9: 验证模式汇总
