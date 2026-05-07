@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v6.42 — T日买入评估 + T+1持有评估 + Y型游资炒作识别
-｜（v6.42：v2.13——板数>=2降权50%、>=4排除；删除总分>=3死亡硬规则；B象限gag=0+1板最优先标记；Y型启动日涨幅>15%过滤；gag>0改为B象限加分项）
+史诗级行情扫描器 v6.56 — T日买入评估 + T日融资爆量分级 + D象限历史启动日过滤
+｜（v6.56：v2.28——D象限pre5>10%否决、D象限启动日距T日>7天否决、融资爆量20~25%区间已在SKILL.md定义）
 ｜（v6.30：基于0126批次调整——前5涨跌<=12%、15日涨跌<=20%、量比<=2.5；新增节前最后交易日检测；修复API频率限制：每20只股票延迟0.5秒）
 ｜（v6.29：整合param_tuning.md v6.29参数调整——前5日涨跌<=8%、前15日涨跌<=15%、小实体天数>=6、大实体0天+量比>=5排除、小实体8~9天+前5日0~5%排除）
 ｜（v6.16：融资条款全部降级为参考信息——Y型移除硬过滤（条件②前5日rzche比>5%、条件③启动日rzche比>15%、条件⑩融资蓄力比<=2倍），仅作参考展示；移除Y总分≥35门槛）
@@ -1234,8 +1234,34 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
         (df_filtered['gap'] > 0)
     )
 
+    # 调整7：D象限 + pre5_chg > 10% → 否决（v2.28新增——高位跟涨陷阱）
+    # 实证：000990 pre5=+10.3%却成功，但这是低概率随机事件(1/10)，不能因为1个例外保留10个风险
+    d_pre5_too_high = (
+        (df_filtered['quadrant'] == 'D') &
+        (df_filtered['pre5_chg'] > 10)
+    )
+    n_d_pre5_skip = d_pre5_too_high.sum()
+    if n_d_pre5_skip > 0:
+        print(f"⚠️  D象限pre5>10%：{n_d_pre5_skip}只否决（高位跟涨风险）")
+        df_filtered.loc[d_pre5_too_high, 'board_excluded'] = True
+
+    # 调整8：D象限启动日距T日>7天 → 否决（v2.28新增——历史启动日陷阱）
+    # 原理：启动日早已过去（如0325启动、0407才扫到），这些股票早已完成主升，不是真正的"启动日买入"
+    d_launch_too_old = (
+        (df_filtered['quadrant'] == 'D') &
+        (df_filtered['launch_idx'] >= 0) &
+        ((df_filtered['scan_idx'] - df_filtered['launch_idx']) > 7)
+    )
+    n_d_launch_skip = d_launch_too_old.sum()
+    if n_d_launch_skip > 0:
+        print(f"⚠️  D象限启动日距T日>7天：{n_d_launch_skip}只否决（历史启动日陷阱）")
+        df_filtered.loc[d_launch_too_old, 'board_excluded'] = True
+
+    # 重新过滤被排除的股票
+    df_filtered = df_filtered[~df_filtered['board_excluded']]
+
     n_after = len(df_filtered)
-    print(f"📊 候选过滤: {n_before} -> {n_after} 只（v2.13调整后）\n")
+    print(f"📊 候选过滤: {n_before} -> {n_after} 只（v2.28调整后）\n")
 
     # ═══════════════════════════════════════════════════════════
     # 打印汇总表
