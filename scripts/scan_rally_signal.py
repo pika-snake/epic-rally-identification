@@ -1250,7 +1250,7 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
     d_launch_too_old = (
         (df_filtered['quadrant'] == 'D') &
         (df_filtered['launch_idx'] >= 0) &
-        ((df_filtered['scan_idx'] - df_filtered['launch_idx']) > 7)
+        ((scan_idx - df_filtered['launch_idx']) > 7)
     )
     n_d_launch_skip = d_launch_too_old.sum()
     if n_d_launch_skip > 0:
