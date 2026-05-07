@@ -1,12 +1,10 @@
 # 黑马框架 HANDOFF — 2026-05-02
 
 ## 当前版本
-- **框架版本**: v5.0
-- **脚本**: `scripts/scan_rally_signal.py` v5.0（R型游资快速拉升型识别）
-- **样本库**: `samples/` (S-001~S-006, F-001~F-005, M-001~M-003, W-001, A-001~A-002, B-001)
+- **框架版本**: v6.5
+- **脚本**: `scripts/scan_rally_signal.py` v6.5（Y型综合强度分=基础分+安静Bonus+慢建仓Bonus+急跌挖坑Bonus；急跌挖坑Bonus=6.0分：有"启动前急跌>=5% + 后续5日缩量>=30%"结构）
+- **最新Commit**: 本地v6.5，待commit+push
 - **GitHub**: https://github.com/pika-snake/epic-rally-identification
-- **最新Commit**: `2d0931d` — v4.3（find_true_launch_date参数化，待push）
-
 ---
 
 ## 重大教训（2026-04-30）
@@ -73,7 +71,8 @@
 - v4.2涨跌过滤：启动前15日窗口内涨跌绝对值>=5%的天数>=4 → 硬排除（v4.1扩大窗口到15日+>=4天；v4.2新增：启动日识别阶段就做pre8检查，不干净的候选启动日直接跳过）
 - v4.3参数化门槛：find_true_launch_date内部硬编码>=7改为min_rise_pct参数，-t 6时行为正确
 - v5.3 量比验证：新增温和放量条件，前一天跌+启动日量比<1.5也得1分
-- v5.5 黑马排除R型：黑马汇总表过滤条件增加is_r_type==False，R型成功率低不作为黑马
+- v5.5 黑马排除R型+Y型：黑马汇总表过滤条件增加is_r_type==False AND is_y_type==False，R型+Y型成功率低不作为黑马
+- v6.0 Y型指标：rzche/rzye（融资占余额比）替代融资脉冲天数；Y型5条件：vol_ratio>1.5 + pre5d均值>5% + 启动日>15% + pre15异动<5 + 非月线过热
 
 ---
 
