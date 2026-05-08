@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-史诗级行情扫描器 v6.56 — T日买入评估 + T日融资爆量分级 + D象限历史启动日过滤
+史诗级行情扫描器 v6.57 — T日买入评估 + T日融资爆量分级 + D象限历史启动日过滤
+｜（v6.57：修复bug——gag=None时仍检查启动日距T日>7天否决；v2.33发现凯莱英gap=None绕过该规则导致失败）
 ｜（v6.56：v2.28——D象限pre5>10%否决、D象限启动日距T日>7天否决、融资爆量20~25%区间已在SKILL.md定义）
 ｜（v6.30：基于0126批次调整——前5涨跌<=12%、15日涨跌<=20%、量比<=2.5；新增节前最后交易日检测；修复API频率限制：每20只股票延迟0.5秒）
 ｜（v6.29：整合param_tuning.md v6.29参数调整——前5日涨跌<=8%、前15日涨跌<=15%、小实体天数>=6、大实体0天+量比>=5排除、小实体8~9天+前5日0~5%排除）
@@ -1247,10 +1248,16 @@ def scan_date(target_date=None, verify_mode=False, codes_filter=None, min_rise_p
 
     # 调整8：D象限启动日距T日>7天 → 否决（v2.28新增——历史启动日陷阱）
     # 原理：启动日早已过去（如0325启动、0407才扫到），这些股票早已完成主升，不是真正的"启动日买入"
+    # v6.57修复：gag=None（launch_idx=-1）时也需检查启动日距T日——凯莱英启动日20260213距0304约19天，
+    #   因launch_idx=-1绕过了检查导致失败。修复：launch_idx<0的D象限股票也应被否决（无法确认启动日是否太老）
     d_launch_too_old = (
         (df_filtered['quadrant'] == 'D') &
-        (df_filtered['launch_idx'] >= 0) &
-        ((scan_idx - df_filtered['launch_idx']) > 7)
+        (
+            # 情况1：有有效launch_idx但距T日>7天
+            ((df_filtered['launch_idx'] >= 0) & ((scan_idx - df_filtered['launch_idx']) > 7)) |
+            # 情况2：无法确定启动日（launch_idx=-1/gag=None）的D象限股票——无法确认为新启动，排除
+            (df_filtered['launch_idx'] < 0)
+        )
     )
     n_d_launch_skip = d_launch_too_old.sum()
     if n_d_launch_skip > 0:
